@@ -1,0 +1,18 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+build/
+
+# Credentials (NEVER commit)
+src/credentials.h
+
+# OS
+.DS_Store
+Thumbs.db
