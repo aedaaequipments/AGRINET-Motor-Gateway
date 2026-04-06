@@ -1,9 +1,10 @@
 /**
  * @file cloud_sync.c
- * @brief Firebase Cloud Sync matching Sasyamithra App v6.2 schema
+ * @brief MQTT Cloud Sync for Sasyamithra self-hosted server (C1/C2 fix)
  *
+ * Replaces Firebase HTTP REST with MQTT publish/subscribe.
  * All JSON built with snprintf (no String class, no dynamic allocation).
- * Firebase REST API via GSM HTTP driver.
+ * Motor commands received via subscription callback instead of polling.
  */
 
 #include "cloud_sync.h"
@@ -20,37 +21,108 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static char s_jsonBuf[JSON_BUF_SIZE];
-static char s_respBuf[256];
-static char s_pathBuf[128];
+static char s_topicBuf[128];
 static uint32_t s_lastPushTick = 0;
-static uint32_t s_lastPollTick = 0;
 static uint32_t s_lastHeartbeatTick = 0;
-static uint32_t s_lastConfigSyncTick = 0;
+static bool s_mqttSubscribed = false;
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * INIT
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * MQTT INCOMING MESSAGE HANDLER
+ * Replaces Firebase HTTP polling — commands arrive via subscription
+ * ════════════════════════════════════════════════��══════════════════════════ */
 
-void CloudSync_Init(void)
+static void OnMqttMessage(const char* topic, const char* payload, uint16_t payloadLen)
 {
-    s_lastPushTick = HAL_GetTick();
-    s_lastPollTick = HAL_GetTick();
-    s_lastHeartbeatTick = HAL_GetTick();
-    s_lastConfigSyncTick = HAL_GetTick();
+    FlashConfig_t* cfg = FlashConfig_Get();
+
+    /* Only process cmd/.../set topics for this device */
+    if (strstr(topic, "/set") == NULL) return;
+    if (strstr(topic, cfg->deviceId) == NULL) return;
+
+    /* Parse "run" field — same logic as old CloudSync_PollMotorCommands */
+    const char* p = strstr(payload, "\"run\":");
+    if (p) {
+        p += 6;
+        bool remoteRun = (strncmp(p, "true", 4) == 0);
+        bool localRun = MotorControl_IsRunning();
+
+        if (remoteRun && !localRun) {
+            MotorControl_Start();
+            CloudSync_LogCommand("motor", cfg->deviceId, "start");
+        } else if (!remoteRun && localRun) {
+            MotorControl_Stop(FAULT_REMOTE_STOP);
+            CloudSync_LogCommand("motor", cfg->deviceId, "stop");
+        }
+    }
+
+    /* Parse "forceRun" */
+    p = strstr(payload, "\"forceRun\":");
+    if (p) {
+        p += 11;
+        MotorControl_SetForceRun(strncmp(p, "true", 4) == 0);
+    }
+
+    /* Parse "safeMode" */
+    p = strstr(payload, "\"safeMode\":");
+    if (p) {
+        p += 11;
+        MotorControl_SetSafeMode(strncmp(p, "true", 4) == 0);
+    }
+
+    /* Parse "starDelta" */
+    p = strstr(payload, "\"starDelta\":");
+    if (p) {
+        p += 12;
+        float sd = strtof(p, NULL);
+        if (sd >= 1.0f && sd <= 30.0f) {
+            FlashConfig_SetStarDeltaDelay(sd);
+        }
+    }
+
+    /* Parse protection thresholds */
+    p = strstr(payload, "\"overV\":");
+    if (p) {
+        p += 8;
+        float v = strtof(p, NULL);
+        if (v > 200.0f && v < 500.0f) {
+            ProtectionConfig_t prot;
+            memcpy(&prot, &cfg->protection, sizeof(prot));
+            prot.overVoltage = v;
+
+            const char* q = strstr(payload, "\"underV\":");
+            if (q) { q += 9; prot.underVoltage = strtof(q, NULL); }
+
+            q = strstr(payload, "\"overload\":");
+            if (q) { q += 11; prot.overloadAmps = strtof(q, NULL); }
+
+            q = strstr(payload, "\"dryRun\":");
+            if (q) { q += 9; prot.dryRunSec = (uint16_t)strtof(q, NULL); }
+
+            q = strstr(payload, "\"restart\":");
+            if (q) { q += 10; prot.restartDelay = (uint16_t)strtof(q, NULL); }
+
+            FlashConfig_SetProtection(&prot);
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * JSON BUILDERS (snprintf, no dynamic allocation)
+ * TOPIC BUILDERS — match server mqtt-handler.js topic schema
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static void BuildTopic(const char* type, const char* deviceId, const char* suffix)
+{
+    FlashConfig_t* cfg = FlashConfig_Get();
+    snprintf(s_topicBuf, sizeof(s_topicBuf), "%s/%s/%s/%s",
+             type, cfg->farmId, deviceId, suffix);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * JSON BUILDERS (same payload format as before — transport-agnostic)
+ * ═══════════════════════════════════��═══════════════════════════════════════ */
+
 /**
- * Build motor telemetry JSON matching app schema:
- * {
- *   "run": true, "phV": {"r": 231, "y": 229, "b": 230},
- *   "phI": {"r": 4.2, "y": 4.1, "b": 4.3},
- *   "pf": {"o": 0.92, "r": 0.91, "y": 0.93, "b": 0.92},
- *   "pwr": 2.5, "hp": "good"
- * }
+ * Build motor telemetry JSON — field names match server ALLOWED_FIELDS
  */
 static uint16_t BuildMotorJson(const PowerSnapshot_t* p, bool running,
                                 HealthStatus_t health)
@@ -70,9 +142,9 @@ static uint16_t BuildMotorJson(const PowerSnapshot_t* p, bool running,
         "\"kwh\":%.1f,"
         "\"hrs\":%.1f,"
         "\"hp\":\"%s\","
-        "\"mode\":\"%s\","
         "\"forceRun\":%s,"
-        "\"safeMode\":%s}",
+        "\"safeMode\":%s,"
+        "\"isRunning\":%s}",
         running ? "true" : "false",
         p->r.voltage, p->y.voltage, p->b.voltage,
         p->r.current, p->y.current, p->b.current,
@@ -81,41 +153,30 @@ static uint16_t BuildMotorJson(const PowerSnapshot_t* p, bool running,
         cfg->stats.totalKwh,
         cfg->stats.totalHours,
         hpStr,
-        cfg->mode == MODE_AUTO ? "auto" : "manual",
         cfg->forceRun ? "true" : "false",
-        cfg->safeMode ? "true" : "false"
+        cfg->safeMode ? "true" : "false",
+        running ? "true" : "false"
     );
 }
 
-/**
- * Build weather sensor JSON matching app sensorLog schema
- */
 static uint16_t BuildWeatherJson(const WeatherPayload_t* w)
 {
     return snprintf(s_jsonBuf, JSON_BUF_SIZE,
-        "{\"airT\":%.1f,\"soilT\":%.1f,\"humid\":%.1f,"
-        "\"soilM\":%.1f,\"soilM1\":%.1f,\"soilM2\":%.1f,\"soilM3\":%.1f,"
-        "\"light\":%.1f,\"leafW\":%u,\"leafW2\":%u,"
-        "\"wind\":%.1f,\"rain\":%.1f,\"batt\":%.0f}",
+        "{\"airTemperature\":%.1f,\"soilTemperature\":%.1f,\"humidity\":%.1f,"
+        "\"soilMoisture\":%.1f,\"soilMoisture2\":%.1f,\"soilMoisture3\":%.1f,"
+        "\"lightIntensity\":%.1f,\"leafWetness\":%u,\"leafWetness2\":%u}",
         (float)w->airTemp / 100.0f,
         (float)w->soilTemp / 100.0f,
         (float)w->humidity / 100.0f,
-        (float)w->soilM2 / 100.0f,   // soilM = L2 (primary)
-        (float)w->soilM1 / 100.0f,
+        (float)w->soilM2 / 100.0f,
         (float)w->soilM2 / 100.0f,
         (float)w->soilM3 / 100.0f,
-        (float)w->lightLux * 10.0f / 655.35f,  // Normalize to 0-100%
+        (float)w->lightLux * 10.0f / 655.35f,
         w->leafWet1,
-        w->leafWet2,
-        (float)w->windSpeed / 100.0f,
-        (float)w->rainMm / 10.0f,
-        (float)w->batteryMv / 1000.0f * 100.0f  // mV to %
+        w->leafWet2
     );
 }
 
-/**
- * Build valve status JSON
- */
 static uint16_t BuildValveJson(const ValvePayload_t* v)
 {
     return snprintf(s_jsonBuf, JSON_BUF_SIZE,
@@ -125,9 +186,6 @@ static uint16_t BuildValveJson(const ValvePayload_t* v)
     );
 }
 
-/**
- * Build alert JSON
- */
 static uint16_t BuildAlertJson(const char* name, const char* type,
                                 const char* severity, const char* action)
 {
@@ -139,21 +197,66 @@ static uint16_t BuildAlertJson(const char* name, const char* type,
     );
 }
 
-/**
- * Build command log JSON
- */
-static uint16_t BuildCmdLogJson(const char* devType, const char* devId,
-                                 const char* action)
+/* ═══════════════════════════════════════════════════════════════════════════
+ * INIT
+ * ════════════════════════════════════════════════���══════════════════════════ */
+
+void CloudSync_Init(void)
 {
-    return snprintf(s_jsonBuf, JSON_BUF_SIZE,
-        "{\"type\":\"%s\",\"deviceId\":\"%s\",\"action\":\"%s\"}",
-        devType, devId, action
-    );
+    s_lastPushTick = HAL_GetTick();
+    s_lastHeartbeatTick = HAL_GetTick();
+    s_mqttSubscribed = false;
+
+    /* Register incoming message callback */
+    GSM_MqttSetCallback(OnMqttMessage);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * PUBLIC API
+ * MQTT CONNECTION + SUBSCRIPTION (called from Update loop)
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static bool EnsureMqttConnected(void)
+{
+    if (GSM_IsReady()) return true;
+
+    /* Network ready but MQTT not connected — try to connect */
+    if (GSM_GetState() != GSM_STATE_NETWORK_READY) return false;
+
+    FlashConfig_t* cfg = FlashConfig_Get();
+
+    bool ok = GSM_MqttConnect(
+        cfg->mqttBrokerIp,
+        cfg->mqttBrokerPort,
+        cfg->deviceId,          /* clientId = device ID */
+        cfg->mqttUsername,
+        cfg->mqttPassword
+    );
+
+    if (ok) {
+        s_mqttSubscribed = false;  /* Need to re-subscribe after connect */
+    }
+
+    return ok;
+}
+
+static void EnsureSubscribed(void)
+{
+    if (s_mqttSubscribed) return;
+
+    FlashConfig_t* cfg = FlashConfig_Get();
+
+    /* Subscribe to command topic for this device: cmd/+/{deviceId}/set
+     * The + wildcard matches any userId (server publishes cmd/{userId}/{deviceId}/set) */
+    snprintf(s_topicBuf, sizeof(s_topicBuf), "cmd/+/%s/set", cfg->deviceId);
+
+    if (GSM_MqttSubscribe(s_topicBuf, 1)) {
+        s_mqttSubscribed = true;
+    }
+}
+
+/* ══════════════════════════════════════════���════════════════════════════════
+ * PUBLIC API
+ * ═════════════════���═══════════════════════════��═════════════════════════════ */
 
 bool CloudSync_PushMotorData(const PowerSnapshot_t* power,
                               bool running, HealthStatus_t health)
@@ -162,91 +265,9 @@ bool CloudSync_PushMotorData(const PowerSnapshot_t* power,
 
     FlashConfig_t* cfg = FlashConfig_Get();
     BuildMotorJson(power, running, health);
+    BuildTopic("data", cfg->deviceId, "telemetry");
 
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "motors/%s", cfg->deviceId);
-    uint16_t status = GSM_HttpRequest(HTTP_PUT, s_pathBuf, s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
-}
-
-bool CloudSync_PollMotorCommands(void)
-{
-    if (!GSM_IsReady()) return false;
-
-    FlashConfig_t* cfg = FlashConfig_Get();
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "motors/%s", cfg->deviceId);
-
-    uint16_t status = GSM_HttpRequest(HTTP_GET, s_pathBuf, NULL,
-                                       s_respBuf, sizeof(s_respBuf));
-    if (status < 200 || status >= 300) return false;
-
-    /* Parse "run" field */
-    char* p = strstr(s_respBuf, "\"run\":");
-    if (p) {
-        p += 6;
-        bool remoteRun = (strncmp(p, "true", 4) == 0);
-        bool localRun = MotorControl_IsRunning();
-
-        if (remoteRun && !localRun) {
-            MotorControl_Start();
-            CloudSync_LogCommand("motor", cfg->deviceId, "start");
-        } else if (!remoteRun && localRun) {
-            MotorControl_Stop(FAULT_REMOTE_STOP);
-            CloudSync_LogCommand("motor", cfg->deviceId, "stop");
-        }
-    }
-
-    /* Parse "forceRun" */
-    p = strstr(s_respBuf, "\"forceRun\":");
-    if (p) {
-        p += 11;
-        MotorControl_SetForceRun(strncmp(p, "true", 4) == 0);
-    }
-
-    /* Parse "safeMode" -- field name in app may be just part of motor obj */
-    p = strstr(s_respBuf, "\"safeMode\":");
-    if (p) {
-        p += 11;
-        MotorControl_SetSafeMode(strncmp(p, "true", 4) == 0);
-    }
-
-    /* Parse "starDelta" */
-    p = strstr(s_respBuf, "\"starDelta\":");
-    if (p) {
-        p += 12;
-        float sd = strtof(p, NULL);
-        if (sd >= 1.0f && sd <= 30.0f) {
-            FlashConfig_SetStarDeltaDelay(sd);
-        }
-    }
-
-    /* Parse protection thresholds */
-    p = strstr(s_respBuf, "\"overV\":");
-    if (p) {
-        p += 8;
-        float v = strtof(p, NULL);
-        if (v > 200.0f && v < 500.0f) {
-            ProtectionConfig_t prot;
-            memcpy(&prot, &cfg->protection, sizeof(prot));
-            prot.overVoltage = v;
-
-            /* Also parse other prot fields */
-            char* q = strstr(s_respBuf, "\"underV\":");
-            if (q) { q += 9; prot.underVoltage = strtof(q, NULL); }
-
-            q = strstr(s_respBuf, "\"overload\":");
-            if (q) { q += 11; prot.overloadAmps = strtof(q, NULL); }
-
-            q = strstr(s_respBuf, "\"dryRun\":");
-            if (q) { q += 9; prot.dryRunSec = (uint16_t)strtof(q, NULL); }
-
-            q = strstr(s_respBuf, "\"restart\":");
-            if (q) { q += 10; prot.restartDelay = (uint16_t)strtof(q, NULL); }
-
-            FlashConfig_SetProtection(&prot);
-        }
-    }
-
-    return true;
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 1);
 }
 
 bool CloudSync_PushWeatherData(const WeatherPayload_t* weather,
@@ -255,9 +276,9 @@ bool CloudSync_PushWeatherData(const WeatherPayload_t* weather,
     if (!GSM_IsReady()) return false;
 
     BuildWeatherJson(weather);
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "sensorLog/%s", stationId);
-    uint16_t status = GSM_HttpRequest(HTTP_POST, s_pathBuf, s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
+    BuildTopic("data", stationId, "weather");
+
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 1);
 }
 
 bool CloudSync_PushValveStatus(const ValvePayload_t* valve,
@@ -266,27 +287,9 @@ bool CloudSync_PushValveStatus(const ValvePayload_t* valve,
     if (!GSM_IsReady()) return false;
 
     BuildValveJson(valve);
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "valves/%s", valveId);
-    uint16_t status = GSM_HttpRequest(HTTP_PUT, s_pathBuf, s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
-}
+    BuildTopic("data", valveId, "telemetry");
 
-bool CloudSync_PollValveCommand(const char* valveId, bool* isOpen)
-{
-    if (!GSM_IsReady()) return false;
-
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "valves/%s", valveId);
-    uint16_t status = GSM_HttpRequest(HTTP_GET, s_pathBuf, NULL,
-                                       s_respBuf, sizeof(s_respBuf));
-    if (status < 200 || status >= 300) return false;
-
-    char* p = strstr(s_respBuf, "\"isOpen\":");
-    if (p) {
-        p += 9;
-        *isOpen = (strncmp(p, "true", 4) == 0);
-        return true;
-    }
-    return false;
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 1);
 }
 
 bool CloudSync_PushAlert(const char* name, const char* type,
@@ -294,9 +297,11 @@ bool CloudSync_PushAlert(const char* name, const char* type,
 {
     if (!GSM_IsReady()) return false;
 
+    FlashConfig_t* cfg = FlashConfig_Get();
     BuildAlertJson(name, type, severity, action);
-    uint16_t status = GSM_HttpRequest(HTTP_POST, "alerts", s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
+    BuildTopic("alert", cfg->deviceId, "warn");
+
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 1);
 }
 
 bool CloudSync_LogCommand(const char* deviceType, const char* deviceId,
@@ -304,9 +309,12 @@ bool CloudSync_LogCommand(const char* deviceType, const char* deviceId,
 {
     if (!GSM_IsReady()) return false;
 
-    BuildCmdLogJson(deviceType, deviceId, action);
-    uint16_t status = GSM_HttpRequest(HTTP_POST, "cmdLog", s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
+    snprintf(s_jsonBuf, JSON_BUF_SIZE,
+        "{\"type\":\"%s\",\"deviceId\":\"%s\",\"action\":\"%s\"}",
+        deviceType, deviceId, action);
+    BuildTopic("data", deviceId, "cmdlog");
+
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 0);
 }
 
 bool CloudSync_Heartbeat(void)
@@ -315,24 +323,16 @@ bool CloudSync_Heartbeat(void)
 
     FlashConfig_t* cfg = FlashConfig_Get();
     snprintf(s_jsonBuf, JSON_BUF_SIZE,
-        "{\"online\":true,\"signal\":%u}",
-        GSM_GetSignalQuality());
+        "{\"online\":true,\"signal\":%u,\"fw\":\"%s\"}",
+        GSM_GetSignalQuality(), FW_VERSION_STR);
 
-    snprintf(s_pathBuf, sizeof(s_pathBuf), "motors/%s/connectivity", cfg->deviceId);
-    uint16_t status = GSM_HttpRequest(HTTP_PUT, s_pathBuf, s_jsonBuf, NULL, 0);
-    return (status >= 200 && status < 300);
-}
-
-bool CloudSync_SyncConfig(void)
-{
-    /* For now, just pull config from Firebase.
-     * Full bidirectional sync with timestamps will be added in Phase 3. */
-    return CloudSync_PollMotorCommands();
+    BuildTopic("status", cfg->deviceId, "heartbeat");
+    return GSM_MqttPublish(s_topicBuf, s_jsonBuf, 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * MAIN UPDATE LOOP (called from Task_CloudSync)
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * MAIN UPDATE LOOP (called from Task_CloudSync every 1000ms)
+ * ═════════════════════════════════════════════════════════════════════��═════ */
 
 void CloudSync_Update(void)
 {
@@ -341,7 +341,14 @@ void CloudSync_Update(void)
     /* Run GSM state machine (error recovery) */
     GSM_Update();
 
-    if (!GSM_IsReady()) return;
+    /* Ensure MQTT connected (auto-reconnect on failure) */
+    if (!EnsureMqttConnected()) return;
+
+    /* Ensure subscribed to command topic */
+    EnsureSubscribed();
+
+    /* Process incoming MQTT messages (command subscription) */
+    GSM_MqttProcessIncoming();
 
     /* Push motor telemetry every CLOUD_PUSH_PERIOD_MS */
     if ((now - s_lastPushTick) >= CLOUD_PUSH_PERIOD_MS) {
@@ -366,21 +373,9 @@ void CloudSync_Update(void)
         }
     }
 
-    /* Poll commands every CLOUD_POLL_PERIOD_MS */
-    if ((now - s_lastPollTick) >= CLOUD_POLL_PERIOD_MS) {
-        s_lastPollTick = now;
-        CloudSync_PollMotorCommands();
-    }
-
     /* Heartbeat every HEARTBEAT_PERIOD_MS */
     if ((now - s_lastHeartbeatTick) >= HEARTBEAT_PERIOD_MS) {
         s_lastHeartbeatTick = now;
         CloudSync_Heartbeat();
-    }
-
-    /* Config sync every 60 seconds */
-    if ((now - s_lastConfigSyncTick) >= 60000) {
-        s_lastConfigSyncTick = now;
-        CloudSync_SyncConfig();
     }
 }

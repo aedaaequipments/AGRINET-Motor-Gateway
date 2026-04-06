@@ -1,8 +1,9 @@
 /**
  * @file gsm_driver.h
- * @brief SIM7670C 4G GSM AT Command Driver (State Machine)
+ * @brief SIM7670C 4G GSM AT Command Driver (MQTT + HTTP)
  *
- * Provides HTTP GET/POST/PUT/PATCH operations for Firebase REST API.
+ * Provides MQTT publish/subscribe for Sasyamithra self-hosted server.
+ * C1/C2 fix: Replaces Firebase HTTP polling with MQTT push/subscribe.
  * Thread-safe via FreeRTOS mutex. Implements exponential backoff on errors.
  */
 
@@ -17,22 +18,24 @@ extern "C" {
 
 typedef enum {
     GSM_STATE_INIT,
-    GSM_STATE_READY,
-    GSM_STATE_HTTP_ACTIVE,
+    GSM_STATE_NETWORK_READY,    // Network registered, MQTT not yet started
+    GSM_STATE_MQTT_CONNECTING,  // MQTT service started, connecting to broker
+    GSM_STATE_MQTT_CONNECTED,   // Connected to MQTT broker, ready for pub/sub
     GSM_STATE_ERROR,
     GSM_STATE_RESETTING,
 } GsmState_t;
 
-typedef enum {
-    HTTP_GET    = 0,
-    HTTP_POST   = 1,
-    HTTP_PATCH  = 3,    // Note: SIM7670 may not support PATCH natively
-    HTTP_PUT    = 4,
-} HttpMethod_t;
+/**
+ * @brief Callback for incoming MQTT messages (from subscribed topics)
+ * @param topic  Topic string (null-terminated)
+ * @param payload  Payload string (null-terminated, usually JSON)
+ * @param payloadLen  Length of payload
+ */
+typedef void (*MqttMessageCallback)(const char* topic, const char* payload, uint16_t payloadLen);
 
 /**
- * @brief Initialize GSM module (USART3, GPIO)
- * @return true if module responds to AT
+ * @brief Initialize GSM module (USART3, GPIO, network registration)
+ * @return true if module responds and network registered
  */
 bool GSM_Init(void);
 
@@ -42,35 +45,67 @@ bool GSM_Init(void);
 GsmState_t GSM_GetState(void);
 
 /**
- * @brief Check if GSM is ready for HTTP operations
+ * @brief Check if MQTT is connected and ready for operations
  */
 bool GSM_IsReady(void);
 
 /**
  * @brief Get network time from GSM (AT+CCLK?)
- * @param buf Buffer for time string (min 32 bytes)
- * @return true if time retrieved
  */
 bool GSM_GetNetworkTime(char* buf, uint16_t bufLen);
 
 /**
- * @brief Get signal quality
- * @return RSSI value (0-31, 99=unknown)
+ * @brief Get signal quality (RSSI 0-31, 99=unknown)
  */
 uint8_t GSM_GetSignalQuality(void);
 
+/* ─── MQTT Operations ──────────────────────────────────────────── */
+
 /**
- * @brief Perform HTTP request to Firebase
- * @param method GET, POST, PUT, or PATCH
- * @param path Firebase path (e.g., "/users/abc/motors/MOT-001-A1")
- * @param jsonBody JSON body for POST/PUT/PATCH (NULL for GET)
- * @param response Buffer for response body
- * @param respLen Max response buffer length
- * @return HTTP status code (200=OK), 0 on failure
+ * @brief Start MQTT service and connect to broker
+ * @param brokerIp  Broker IP address (e.g., "192.168.1.100")
+ * @param port      Broker port (e.g., 1883)
+ * @param clientId  MQTT client ID (e.g., "MOT-001-A1")
+ * @param username  MQTT username (empty string for no auth)
+ * @param password  MQTT password (empty string for no auth)
+ * @return true if connected successfully
  */
-uint16_t GSM_HttpRequest(HttpMethod_t method, const char* path,
-                          const char* jsonBody,
-                          char* response, uint16_t respLen);
+bool GSM_MqttConnect(const char* brokerIp, uint16_t port,
+                     const char* clientId,
+                     const char* username, const char* password);
+
+/**
+ * @brief Publish message to MQTT topic
+ * @param topic   Topic string (e.g., "data/farm01/MOT-001-A1/telemetry")
+ * @param payload JSON payload string
+ * @param qos     QoS level (0 or 1)
+ * @return true if published successfully
+ */
+bool GSM_MqttPublish(const char* topic, const char* payload, uint8_t qos);
+
+/**
+ * @brief Subscribe to MQTT topic
+ * @param topic  Topic string (supports + and # wildcards)
+ * @param qos    QoS level (0 or 1)
+ * @return true if subscribed successfully
+ */
+bool GSM_MqttSubscribe(const char* topic, uint8_t qos);
+
+/**
+ * @brief Set callback for incoming MQTT messages
+ */
+void GSM_MqttSetCallback(MqttMessageCallback cb);
+
+/**
+ * @brief Check for and process incoming MQTT messages (URCs)
+ * Call this periodically from the cloud sync task.
+ */
+void GSM_MqttProcessIncoming(void);
+
+/**
+ * @brief Disconnect from MQTT broker and stop service
+ */
+void GSM_MqttDisconnect(void);
 
 /**
  * @brief Reset GSM module (called on persistent errors)
@@ -78,7 +113,7 @@ uint16_t GSM_HttpRequest(HttpMethod_t method, const char* path,
 void GSM_Reset(void);
 
 /**
- * @brief Run GSM state machine (call periodically to handle recovery)
+ * @brief Run GSM state machine (call periodically for error recovery)
  */
 void GSM_Update(void);
 

@@ -117,6 +117,12 @@ void MotorControl_GetStats(MotorStats_t* stats);
  */
 void MotorControl_ButtonPress(bool isStart);
 
+/**
+ * @brief Turn off all relay outputs (safety function)
+ * Called from stack overflow hook and fault handlers.
+ */
+void AllRelaysOff(void);
+
 #ifdef __cplusplus
 }
 #endif

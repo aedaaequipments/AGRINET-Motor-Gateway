@@ -1,13 +1,14 @@
 /**
  * @file cloud_sync.h
- * @brief Firebase Cloud Sync - data push, command polling, config sync
+ * @brief MQTT Cloud Sync — data push, command subscribe, config sync
  *
- * Matches Sasyamithra App v6.2 Firebase schema:
- *   /users/{uid}/motors/{motorId}/   - motor telemetry + config
- *   /users/{uid}/valves/{valveId}/   - valve status
- *   /users/{uid}/sensorLog/{stationId}/ - weather readings
- *   /users/{uid}/alerts/             - fault alerts
- *   /users/{uid}/cmdLog/             - command history
+ * C1/C2 fix: Replaces Firebase HTTP polling with MQTT publish/subscribe.
+ * Matches Sasyamithra self-hosted server MQTT topic schema:
+ *   data/{farmId}/{deviceId}/telemetry  - motor telemetry (publish)
+ *   data/{farmId}/{stationId}/weather   - weather readings (publish)
+ *   cmd/+/{deviceId}/set                - motor commands (subscribe)
+ *   alert/{farmId}/{deviceId}/warn      - fault alerts (publish)
+ *   status/{farmId}/{deviceId}/heartbeat - online status (publish)
  */
 
 #ifndef CLOUD_SYNC_H
@@ -21,76 +22,54 @@ extern "C" {
 #endif
 
 /**
- * @brief Initialize cloud sync (call after GSM_Init)
+ * @brief Initialize cloud sync + MQTT connection (call after GSM_Init)
  */
 void CloudSync_Init(void);
 
 /**
- * @brief Push motor telemetry to Firebase
- * PATCH /users/{uid}/motors/{motorId}
+ * @brief Push motor telemetry via MQTT
+ * Publishes to: data/{farmId}/{deviceId}/telemetry
  */
 bool CloudSync_PushMotorData(const PowerSnapshot_t* power,
                               bool running, HealthStatus_t health);
 
 /**
- * @brief Poll for motor commands from Firebase
- * GET /users/{uid}/motors/{motorId}
- * Reads: run, forceRun, safeMode, mode, prot.*, starDelta
- * @return true if new command received
- */
-bool CloudSync_PollMotorCommands(void);
-
-/**
- * @brief Push weather station data to Firebase
- * POST /users/{uid}/sensorLog/{stationId}
+ * @brief Push weather station data via MQTT
+ * Publishes to: data/{farmId}/{stationId}/weather
  */
 bool CloudSync_PushWeatherData(const WeatherPayload_t* weather,
                                 const char* stationId);
 
 /**
- * @brief Push valve status to Firebase
- * PATCH /users/{uid}/valves/{valveId}
+ * @brief Push valve status via MQTT
+ * Publishes to: data/{farmId}/{valveId}/telemetry
  */
 bool CloudSync_PushValveStatus(const ValvePayload_t* valve,
                                 const char* valveId);
 
 /**
- * @brief Poll valve commands from Firebase
- * GET /users/{uid}/valves/{valveId}
- * @param valveId Valve device ID
- * @param isOpen Output: requested valve state
- * @return true if command received
- */
-bool CloudSync_PollValveCommand(const char* valveId, bool* isOpen);
-
-/**
- * @brief Push alert to Firebase
- * POST /users/{uid}/alerts
+ * @brief Push alert via MQTT
+ * Publishes to: alert/{farmId}/{deviceId}/warn
  */
 bool CloudSync_PushAlert(const char* name, const char* type,
                           const char* severity, const char* action);
 
 /**
- * @brief Log command to Firebase
- * POST /users/{uid}/cmdLog
+ * @brief Log command via MQTT
+ * Publishes to: data/{farmId}/{deviceId}/cmdlog
  */
 bool CloudSync_LogCommand(const char* deviceType, const char* deviceId,
                            const char* action);
 
 /**
- * @brief Update heartbeat (online status + lastSeen)
+ * @brief Update heartbeat (online status + signal quality)
+ * Publishes to: status/{farmId}/{deviceId}/heartbeat
  */
 bool CloudSync_Heartbeat(void);
 
 /**
- * @brief Sync config with Firebase (bidirectional)
- * Compares timestamps, pulls if app is newer, pushes if local is newer
- */
-bool CloudSync_SyncConfig(void);
-
-/**
  * @brief Run the cloud sync cycle (call from Task_CloudSync)
- * Handles: push telemetry, poll commands, heartbeat, config sync
+ * Handles: MQTT connection, push telemetry, process incoming, heartbeat
  */
 void CloudSync_Update(void);
 

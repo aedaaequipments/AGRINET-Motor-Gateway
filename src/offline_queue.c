@@ -1,6 +1,6 @@
 /**
  * @file offline_queue.c
- * @brief Firebase Offline Queue - circular buffer for GSM outages
+ * @brief MQTT Offline Queue - circular buffer for broker outages
  */
 
 #include "offline_queue.h"
@@ -8,8 +8,8 @@
 #include <string.h>
 
 static OfflinePacket_t s_queue[OFFLINE_QUEUE_SIZE];
-static uint8_t s_head = 0;  // Next write position
-static uint8_t s_tail = 0;  // Next read position
+static uint8_t s_head = 0;
+static uint8_t s_tail = 0;
 static uint8_t s_count = 0;
 
 void OfflineQueue_Init(void)
@@ -20,18 +20,16 @@ void OfflineQueue_Init(void)
     memset(s_queue, 0, sizeof(s_queue));
 }
 
-bool OfflineQueue_Enqueue(HttpMethod_t method, const char* path, const char* json)
+bool OfflineQueue_Enqueue(const char* topic, const char* json, uint8_t qos)
 {
-    /* If full, drop oldest (advance tail) */
     if (s_count >= OFFLINE_QUEUE_SIZE) {
         s_tail = (s_tail + 1) % OFFLINE_QUEUE_SIZE;
         s_count--;
     }
 
     OfflinePacket_t* pkt = &s_queue[s_head];
-    pkt->method = method;
-    strncpy(pkt->path, path, sizeof(pkt->path) - 1);
-    pkt->path[sizeof(pkt->path) - 1] = '\0';
+    strncpy(pkt->topic, topic, OFFLINE_TOPIC_MAX_LEN - 1);
+    pkt->topic[OFFLINE_TOPIC_MAX_LEN - 1] = '\0';
 
     if (json) {
         strncpy(pkt->json, json, OFFLINE_PKT_MAX_LEN - 1);
@@ -40,6 +38,7 @@ bool OfflineQueue_Enqueue(HttpMethod_t method, const char* path, const char* jso
         pkt->json[0] = '\0';
     }
 
+    pkt->qos = qos;
     pkt->timestamp = HAL_GetTick();
 
     s_head = (s_head + 1) % OFFLINE_QUEUE_SIZE;
@@ -52,20 +51,16 @@ uint8_t OfflineQueue_Flush(void)
     if (!GSM_IsReady() || s_count == 0) return 0;
 
     uint8_t sent = 0;
-    char resp[64];
 
     while (s_count > 0) {
         OfflinePacket_t* pkt = &s_queue[s_tail];
 
-        const char* body = (pkt->json[0] != '\0') ? pkt->json : NULL;
-        uint16_t status = GSM_HttpRequest(pkt->method, pkt->path, body, resp, sizeof(resp));
-
-        if (status >= 200 && status < 300) {
+        if (GSM_MqttPublish(pkt->topic, pkt->json, pkt->qos)) {
             sent++;
             s_tail = (s_tail + 1) % OFFLINE_QUEUE_SIZE;
             s_count--;
         } else {
-            break;  // GSM failed again, stop trying
+            break;
         }
     }
 

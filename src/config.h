@@ -162,10 +162,10 @@
 #define POWER_SAMPLE_PERIOD_MS  200         // Power monitor sampling period
 #define MOTOR_CHECK_PERIOD_MS   500         // Motor FSM check period
 #define DISPLAY_UPDATE_MS       1000        // OLED refresh rate
-#define CLOUD_PUSH_PERIOD_MS    5000        // Firebase data push interval
-#define CLOUD_POLL_PERIOD_MS    3000        // Firebase command poll interval
+#define CLOUD_PUSH_PERIOD_MS    5000        // MQTT telemetry push interval
+#define CLOUD_POLL_PERIOD_MS    3000        // (unused — MQTT subscribe replaces polling)
 #define LORA_POLL_PERIOD_MS     15000       // LoRa weather station poll
-#define HEARTBEAT_PERIOD_MS     30000       // Firebase heartbeat interval
+#define HEARTBEAT_PERIOD_MS     30000       // MQTT heartbeat interval
 #define BUTTON_DEBOUNCE_MS      200         // Button debounce time
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -186,9 +186,9 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * BUFFER SIZES
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define GSM_RX_BUF_SIZE         512
-#define GSM_TX_BUF_SIZE         384
-#define JSON_BUF_SIZE           512
+#define GSM_RX_BUF_SIZE         384     // Reduced from 512 — MQTT AT responses shorter than HTTP
+#define GSM_TX_BUF_SIZE         256     // Reduced from 384 — longest MQTT AT cmd ~200 chars
+#define JSON_BUF_SIZE           384     // Reduced from 512 — MQTT payloads < 300 chars
 #define LORA_PKT_BUF_SIZE      256
 #define CMD_BUF_SIZE            128
 
@@ -196,9 +196,10 @@
  * DEVICE ID
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define DEVICE_ID_MAX_LEN       16          // "MOT-001-A1\0" = 11 chars
-#define FIREBASE_UID_MAX_LEN    32
-#define FIREBASE_TOKEN_MAX_LEN  48
-#define FIREBASE_URL_MAX_LEN    64
+#define MQTT_BROKER_IP_MAX_LEN  32          // "192.168.1.100\0"
+#define MQTT_USERNAME_MAX_LEN   32
+#define MQTT_PASSWORD_MAX_LEN   32
+#define FARM_ID_MAX_LEN         16          // "farm01\0"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FLASH CONFIG
@@ -330,9 +331,13 @@ typedef struct {
 
     /* Device identity */
     char deviceId[DEVICE_ID_MAX_LEN];           // "MOT-001-A1"
-    char firebaseUid[FIREBASE_UID_MAX_LEN];     // Firebase user UID
-    char firebaseToken[FIREBASE_TOKEN_MAX_LEN]; // Firebase auth token
-    char firebaseUrl[FIREBASE_URL_MAX_LEN];     // Firebase DB URL
+
+    /* MQTT broker (replaces Firebase HTTP — C1/C2 fix) */
+    char mqttBrokerIp[MQTT_BROKER_IP_MAX_LEN];  // Pi4 Mosquitto IP
+    uint16_t mqttBrokerPort;                     // 1883 default
+    char mqttUsername[MQTT_USERNAME_MAX_LEN];     // Mosquitto auth
+    char mqttPassword[MQTT_PASSWORD_MAX_LEN];     // Mosquitto auth
+    char farmId[FARM_ID_MAX_LEN];                // Topic prefix: data/{farmId}/...
 
     /* Motor config */
     ProtectionConfig_t protection;

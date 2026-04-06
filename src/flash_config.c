@@ -1,12 +1,16 @@
 /**
  * @file flash_config.c
  * @brief Persistent configuration in STM32 internal flash (last 1KB page)
+ *
+ * C1/C2 fix: Firebase credentials replaced with MQTT broker config.
+ * UART provisioning updated: SET_BROKER, SET_MQTT_USER, SET_MQTT_PASS, SET_FARM
  */
 
 #include "flash_config.h"
 #include "credentials.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * PRIVATE DATA
@@ -43,13 +47,17 @@ static void ApplyDefaults(FlashConfig_t* cfg)
     memset(cfg, 0, sizeof(FlashConfig_t));
 
     cfg->magic   = FLASH_CONFIG_MAGIC;
-    cfg->version = 1;
+    cfg->version = 2;  /* Bumped from 1 — MQTT replaces Firebase */
 
-    /* Device identity defaults from credentials.h */
-    strncpy(cfg->deviceId,      DEFAULT_DEVICE_ID,       DEVICE_ID_MAX_LEN - 1);
-    strncpy(cfg->firebaseUid,   FIREBASE_DEFAULT_UID,    FIREBASE_UID_MAX_LEN - 1);
-    strncpy(cfg->firebaseToken, FIREBASE_DEFAULT_TOKEN,   FIREBASE_TOKEN_MAX_LEN - 1);
-    strncpy(cfg->firebaseUrl,   FIREBASE_DEFAULT_URL,    FIREBASE_URL_MAX_LEN - 1);
+    /* Device identity */
+    strncpy(cfg->deviceId, DEFAULT_DEVICE_ID, DEVICE_ID_MAX_LEN - 1);
+
+    /* MQTT broker defaults from credentials.h */
+    strncpy(cfg->mqttBrokerIp, MQTT_DEFAULT_BROKER_IP, MQTT_BROKER_IP_MAX_LEN - 1);
+    cfg->mqttBrokerPort = MQTT_DEFAULT_BROKER_PORT;
+    strncpy(cfg->mqttUsername, MQTT_DEFAULT_USERNAME, MQTT_USERNAME_MAX_LEN - 1);
+    strncpy(cfg->mqttPassword, MQTT_DEFAULT_PASSWORD, MQTT_PASSWORD_MAX_LEN - 1);
+    strncpy(cfg->farmId, MQTT_DEFAULT_FARM_ID, FARM_ID_MAX_LEN - 1);
 
     /* Protection defaults */
     cfg->protection.overVoltage  = DEFAULT_OVER_VOLTAGE;
@@ -67,7 +75,7 @@ static void ApplyDefaults(FlashConfig_t* cfg)
     cfg->calibration.calibratedAt = 0;
 
     /* Motor config */
-    cfg->starDeltaDelay = DEFAULT_STAR_DELTA_SEC * 10;  // tenths of seconds
+    cfg->starDeltaDelay = DEFAULT_STAR_DELTA_SEC * 10;
     cfg->mode           = MODE_MANUAL;
     cfg->safeMode       = false;
     cfg->forceRun       = false;
@@ -88,39 +96,30 @@ static void ApplyDefaults(FlashConfig_t* cfg)
 
 static bool ReadFromFlash(FlashConfig_t* cfg)
 {
-    /* Read directly from flash memory-mapped address */
     const FlashConfig_t* flash_cfg = (const FlashConfig_t*)FLASH_CONFIG_ADDR;
 
-    /* Validate magic */
-    if (flash_cfg->magic != FLASH_CONFIG_MAGIC) {
-        return false;
-    }
+    if (flash_cfg->magic != FLASH_CONFIG_MAGIC) return false;
 
-    /* Copy to RAM */
+    /* Reject old v1 config (Firebase layout) — force re-provisioning */
+    if (flash_cfg->version < 2) return false;
+
     memcpy(cfg, flash_cfg, sizeof(FlashConfig_t));
 
-    /* Validate CRC (CRC field itself is excluded) */
     uint16_t calcCrc = FlashConfig_CRC16(
         (const uint8_t*)cfg,
-        sizeof(FlashConfig_t) - sizeof(uint16_t)  // exclude crc field
+        sizeof(FlashConfig_t) - sizeof(uint16_t)
     );
 
-    if (calcCrc != cfg->crc) {
-        return false;
-    }
-
-    return true;
+    return (calcCrc == cfg->crc);
 }
 
 static bool WriteToFlash(const FlashConfig_t* cfg)
 {
     HAL_StatusTypeDef status;
 
-    /* Unlock flash */
     status = HAL_FLASH_Unlock();
     if (status != HAL_OK) return false;
 
-    /* Erase the config page */
     FLASH_EraseInitTypeDef erase;
     uint32_t pageError = 0;
     erase.TypeErase   = FLASH_TYPEERASE_PAGES;
@@ -133,10 +132,9 @@ static bool WriteToFlash(const FlashConfig_t* cfg)
         return false;
     }
 
-    /* Write config as half-words (STM32F1 flash programs in 16-bit units) */
     const uint16_t* src = (const uint16_t*)cfg;
     uint32_t addr = FLASH_CONFIG_ADDR;
-    uint16_t words = (sizeof(FlashConfig_t) + 1) / 2;  // round up
+    uint16_t words = (sizeof(FlashConfig_t) + 1) / 2;
 
     for (uint16_t i = 0; i < words; i++) {
         status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, addr, src[i]);
@@ -159,24 +157,19 @@ bool FlashConfig_Init(void)
 {
     if (ReadFromFlash(&g_config)) {
         g_dirty = false;
-        return true;  // Valid config loaded
+        return true;
     }
 
-    /* No valid config -- apply factory defaults */
     ApplyDefaults(&g_config);
     g_dirty = true;
-    FlashConfig_Save();  // Write defaults to flash
+    FlashConfig_Save();
     return false;
 }
 
-FlashConfig_t* FlashConfig_Get(void)
-{
-    return &g_config;
-}
+FlashConfig_t* FlashConfig_Get(void) { return &g_config; }
 
 bool FlashConfig_Save(void)
 {
-    /* Calculate CRC before writing */
     g_config.crc = FlashConfig_CRC16(
         (const uint8_t*)&g_config,
         sizeof(FlashConfig_t) - sizeof(uint16_t)
@@ -193,6 +186,8 @@ void FlashConfig_FactoryReset(void)
     FlashConfig_Save();
 }
 
+/* ─── Setters ──────────────────────────────────────────────────── */
+
 bool FlashConfig_SetDeviceId(const char* id)
 {
     if (!id || strlen(id) >= DEVICE_ID_MAX_LEN) return false;
@@ -202,29 +197,45 @@ bool FlashConfig_SetDeviceId(const char* id)
     return true;
 }
 
-bool FlashConfig_SetFirebaseUid(const char* uid)
+bool FlashConfig_SetMqttBrokerIp(const char* ip)
 {
-    if (!uid || strlen(uid) >= FIREBASE_UID_MAX_LEN) return false;
-    memset(g_config.firebaseUid, 0, FIREBASE_UID_MAX_LEN);
-    strncpy(g_config.firebaseUid, uid, FIREBASE_UID_MAX_LEN - 1);
+    if (!ip || strlen(ip) >= MQTT_BROKER_IP_MAX_LEN) return false;
+    memset(g_config.mqttBrokerIp, 0, MQTT_BROKER_IP_MAX_LEN);
+    strncpy(g_config.mqttBrokerIp, ip, MQTT_BROKER_IP_MAX_LEN - 1);
     g_dirty = true;
     return true;
 }
 
-bool FlashConfig_SetFirebaseToken(const char* token)
+bool FlashConfig_SetMqttBrokerPort(uint16_t port)
 {
-    if (!token || strlen(token) >= FIREBASE_TOKEN_MAX_LEN) return false;
-    memset(g_config.firebaseToken, 0, FIREBASE_TOKEN_MAX_LEN);
-    strncpy(g_config.firebaseToken, token, FIREBASE_TOKEN_MAX_LEN - 1);
+    g_config.mqttBrokerPort = port;
     g_dirty = true;
     return true;
 }
 
-bool FlashConfig_SetFirebaseUrl(const char* url)
+bool FlashConfig_SetMqttUsername(const char* username)
 {
-    if (!url || strlen(url) >= FIREBASE_URL_MAX_LEN) return false;
-    memset(g_config.firebaseUrl, 0, FIREBASE_URL_MAX_LEN);
-    strncpy(g_config.firebaseUrl, url, FIREBASE_URL_MAX_LEN - 1);
+    if (!username || strlen(username) >= MQTT_USERNAME_MAX_LEN) return false;
+    memset(g_config.mqttUsername, 0, MQTT_USERNAME_MAX_LEN);
+    strncpy(g_config.mqttUsername, username, MQTT_USERNAME_MAX_LEN - 1);
+    g_dirty = true;
+    return true;
+}
+
+bool FlashConfig_SetMqttPassword(const char* password)
+{
+    if (!password || strlen(password) >= MQTT_PASSWORD_MAX_LEN) return false;
+    memset(g_config.mqttPassword, 0, MQTT_PASSWORD_MAX_LEN);
+    strncpy(g_config.mqttPassword, password, MQTT_PASSWORD_MAX_LEN - 1);
+    g_dirty = true;
+    return true;
+}
+
+bool FlashConfig_SetFarmId(const char* farmId)
+{
+    if (!farmId || strlen(farmId) >= FARM_ID_MAX_LEN) return false;
+    memset(g_config.farmId, 0, FARM_ID_MAX_LEN);
+    strncpy(g_config.farmId, farmId, FARM_ID_MAX_LEN - 1);
     g_dirty = true;
     return true;
 }
@@ -271,13 +282,15 @@ void FlashConfig_SetConfigTimestamp(uint32_t ts)
  * UART PROVISIONING COMMANDS
  *
  * Format: "COMMAND ARGS\n"
- *   SET_ID MOT-001-A1
- *   SET_UID abc123def456
- *   SET_TOKEN ffMQgzF2kXETIU...
- *   SET_URL https://project.firebaseio.com
- *   GET_CONFIG
- *   FACTORY_RESET
- *   SAVE
+ *   SET_ID MOT-001-A1          — Device ID
+ *   SET_BROKER 192.168.1.100   — MQTT broker IP
+ *   SET_PORT 1883              — MQTT broker port
+ *   SET_MQTT_USER mqtt_user    — MQTT username
+ *   SET_MQTT_PASS mqtt_pass    — MQTT password
+ *   SET_FARM farm01            — Farm ID for MQTT topics
+ *   GET_CONFIG                 — Print current config
+ *   FACTORY_RESET              — Reset to compiled defaults
+ *   SAVE                       — Write current config to flash
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void FlashConfig_ProcessCommand(const char* cmd, char* response, uint16_t respLen)
@@ -291,39 +304,55 @@ void FlashConfig_ProcessCommand(const char* cmd, char* response, uint16_t respLe
             snprintf(response, respLen, "ERR ID too long\r\n");
         }
     }
-    else if (strncmp(cmd, "SET_UID ", 8) == 0) {
-        if (FlashConfig_SetFirebaseUid(cmd + 8)) {
-            snprintf(response, respLen, "OK UID set\r\n");
+    else if (strncmp(cmd, "SET_BROKER ", 11) == 0) {
+        if (FlashConfig_SetMqttBrokerIp(cmd + 11)) {
+            snprintf(response, respLen, "OK BROKER=%s\r\n", g_config.mqttBrokerIp);
         } else {
-            snprintf(response, respLen, "ERR UID too long\r\n");
+            snprintf(response, respLen, "ERR IP too long\r\n");
         }
     }
-    else if (strncmp(cmd, "SET_TOKEN ", 10) == 0) {
-        if (FlashConfig_SetFirebaseToken(cmd + 10)) {
-            snprintf(response, respLen, "OK TOKEN set\r\n");
+    else if (strncmp(cmd, "SET_PORT ", 9) == 0) {
+        uint16_t port = (uint16_t)atoi(cmd + 9);
+        if (port > 0) {
+            FlashConfig_SetMqttBrokerPort(port);
+            snprintf(response, respLen, "OK PORT=%u\r\n", g_config.mqttBrokerPort);
         } else {
-            snprintf(response, respLen, "ERR TOKEN too long\r\n");
+            snprintf(response, respLen, "ERR Invalid port\r\n");
         }
     }
-    else if (strncmp(cmd, "SET_URL ", 8) == 0) {
-        if (FlashConfig_SetFirebaseUrl(cmd + 8)) {
-            snprintf(response, respLen, "OK URL set\r\n");
+    else if (strncmp(cmd, "SET_MQTT_USER ", 14) == 0) {
+        if (FlashConfig_SetMqttUsername(cmd + 14)) {
+            snprintf(response, respLen, "OK MQTT_USER set\r\n");
         } else {
-            snprintf(response, respLen, "ERR URL too long\r\n");
+            snprintf(response, respLen, "ERR Username too long\r\n");
+        }
+    }
+    else if (strncmp(cmd, "SET_MQTT_PASS ", 14) == 0) {
+        if (FlashConfig_SetMqttPassword(cmd + 14)) {
+            snprintf(response, respLen, "OK MQTT_PASS set\r\n");
+        } else {
+            snprintf(response, respLen, "ERR Password too long\r\n");
+        }
+    }
+    else if (strncmp(cmd, "SET_FARM ", 9) == 0) {
+        if (FlashConfig_SetFarmId(cmd + 9)) {
+            snprintf(response, respLen, "OK FARM=%s\r\n", g_config.farmId);
+        } else {
+            snprintf(response, respLen, "ERR Farm ID too long\r\n");
         }
     }
     else if (strncmp(cmd, "GET_CONFIG", 10) == 0) {
         snprintf(response, respLen,
-            "ID=%s UID=%s HP=%.1f I=%.1fA SD=%u.%us MODE=%d SAFE=%d FORCE=%d\r\n",
+            "ID=%s BROKER=%s:%u FARM=%s HP=%.1f I=%.1fA SD=%u.%us MODE=%d\r\n",
             g_config.deviceId,
-            g_config.firebaseUid,
+            g_config.mqttBrokerIp,
+            g_config.mqttBrokerPort,
+            g_config.farmId,
             g_config.calibration.ratedHP,
             g_config.calibration.ratedCurrent,
             g_config.starDeltaDelay / 10,
             g_config.starDeltaDelay % 10,
-            g_config.mode,
-            g_config.safeMode,
-            g_config.forceRun
+            g_config.mode
         );
     }
     else if (strncmp(cmd, "FACTORY_RESET", 13) == 0) {

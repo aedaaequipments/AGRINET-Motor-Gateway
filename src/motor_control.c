@@ -50,7 +50,7 @@ static inline void RelayDelta(bool on) {
                       on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-static void AllRelaysOff(void) {
+void AllRelaysOff(void) {
     RelayMain(false);
     RelayStar(false);
     RelayDelta(false);

@@ -1,10 +1,10 @@
 /**
  * @file gsm_driver.c
- * @brief SIM7670C AT Command State Machine for Firebase HTTP REST API
+ * @brief SIM7670C AT Command Driver — MQTT Transport (C1/C2 fix)
  *
- * Rewrites the prototype's simple sendATCommand() into a proper state machine
- * with exponential backoff, mutex protection, and error recovery.
+ * Replaces Firebase HTTP REST with AT+CMQTT commands for Mosquitto broker.
  * Uses char arrays (no String class) for memory safety.
+ * Thread-safe via FreeRTOS mutex with exponential backoff on errors.
  */
 
 #include "gsm_driver.h"
@@ -31,7 +31,11 @@ static uint8_t    s_signalQuality = 99;
 /* Buffers */
 static char s_rxBuf[GSM_RX_BUF_SIZE];
 static char s_txBuf[GSM_TX_BUF_SIZE];
-static char s_urlBuf[256];
+
+/* MQTT incoming message callback */
+static MqttMessageCallback s_mqttCallback = NULL;
+static char s_incomingTopic[128];
+static char s_incomingPayload[JSON_BUF_SIZE];
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * UART HELPERS
@@ -83,8 +87,16 @@ static bool SendAT(const char* cmd, const char* expect, uint32_t timeoutMs)
     return (strstr(s_rxBuf, expect) != NULL);
 }
 
+/**
+ * Send raw data (no \r\n) — used for MQTT topic/payload data input
+ */
+static void UART_SendRaw(const char* data, uint16_t len)
+{
+    HAL_UART_Transmit(&s_huart3, (uint8_t*)data, len, 2000);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
- * INIT
+ * GSM INIT (network registration only — MQTT init is separate)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 bool GSM_Init(void)
@@ -135,12 +147,7 @@ bool GSM_Init(void)
 
     SendAT("AT+CGATT=1", "OK", 3000);
 
-    /* Initialize HTTP service */
-    SendAT("AT+HTTPTERM", "OK", 1000);  // Cleanup first
-    if (!SendAT("AT+HTTPINIT", "OK", 2000)) return false;
-    SendAT("AT+HTTPPARA=\"CID\",1", "OK", 1000);
-
-    s_state = GSM_STATE_HTTP_ACTIVE;
+    s_state = GSM_STATE_NETWORK_READY;
     s_errorCount = 0;
     return true;
 }
@@ -150,7 +157,7 @@ bool GSM_Init(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 GsmState_t GSM_GetState(void) { return s_state; }
-bool GSM_IsReady(void) { return s_state == GSM_STATE_HTTP_ACTIVE; }
+bool GSM_IsReady(void) { return s_state == GSM_STATE_MQTT_CONNECTED; }
 
 void GSM_Update(void)
 {
@@ -169,7 +176,8 @@ void GSM_Update(void)
 
     case GSM_STATE_RESETTING:
         if (GSM_Init()) {
-            s_state = GSM_STATE_HTTP_ACTIVE;
+            /* Network ready — caller (CloudSync) will re-establish MQTT */
+            s_state = GSM_STATE_NETWORK_READY;
             s_errorCount = 0;
         } else {
             s_errorCount++;
@@ -186,105 +194,236 @@ void GSM_Update(void)
 
 void GSM_Reset(void)
 {
+    /* Cleanup MQTT service before reset */
+    SendAT("AT+CMQTTDISC=0,60", "OK", 2000);
+    SendAT("AT+CMQTTREL=0", "OK", 1000);
+    SendAT("AT+CMQTTSTOP", "OK", 1000);
+
     s_lastResetTick = HAL_GetTick();
     s_state = GSM_STATE_RESETTING;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * HTTP REQUEST
+ * MQTT OPERATIONS (AT+CMQTT — SIM7670C)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-uint16_t GSM_HttpRequest(HttpMethod_t method, const char* path,
-                          const char* jsonBody,
-                          char* response, uint16_t respLen)
+void GSM_MqttSetCallback(MqttMessageCallback cb)
 {
-    if (s_state != GSM_STATE_HTTP_ACTIVE) return 0;
-    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return 0;
+    s_mqttCallback = cb;
+}
 
-    FlashConfig_t* cfg = FlashConfig_Get();
-    uint16_t httpStatus = 0;
+bool GSM_MqttConnect(const char* brokerIp, uint16_t port,
+                     const char* clientId,
+                     const char* username, const char* password)
+{
+    if (s_state != GSM_STATE_NETWORK_READY && s_state != GSM_STATE_MQTT_CONNECTING) {
+        return false;
+    }
+    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(10000)) != pdTRUE) return false;
 
-    /* Build full URL: {baseUrl}/users/{uid}/{path}.json?auth={token} */
-    snprintf(s_urlBuf, sizeof(s_urlBuf),
-        "%s/users/%s/%s.json?auth=%s",
-        cfg->firebaseUrl, cfg->firebaseUid, path, cfg->firebaseToken);
+    s_state = GSM_STATE_MQTT_CONNECTING;
 
-    /* Set URL */
-    snprintf(s_txBuf, sizeof(s_txBuf), "AT+HTTPPARA=\"URL\",\"%s\"", s_urlBuf);
-    if (!SendAT(s_txBuf, "OK", 2000)) goto fail;
+    /* Cleanup any previous MQTT session */
+    SendAT("AT+CMQTTDISC=0,60", "OK", 2000);
+    SendAT("AT+CMQTTREL=0", "OK", 1000);
+    SendAT("AT+CMQTTSTOP", "OK", 1000);
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* For POST/PUT/PATCH, set content type and send body */
-    if (jsonBody && (method == HTTP_POST || method == HTTP_PUT || method == HTTP_PATCH)) {
-        SendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 1000);
-
-        uint16_t bodyLen = strlen(jsonBody);
-        snprintf(s_txBuf, sizeof(s_txBuf), "AT+HTTPDATA=%u,10000", bodyLen);
-        if (!SendAT(s_txBuf, "DOWNLOAD", 2000)) goto fail;
-
-        /* Send JSON body */
-        UART_Send(jsonBody);
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    /* Start MQTT service */
+    if (!SendAT("AT+CMQTTSTART", "OK", 3000)) {
+        /* Check if already started */
+        if (strstr(s_rxBuf, "+CMQTTSTART: 0") == NULL) {
+            goto mqtt_fail;
+        }
     }
 
-    /* Execute HTTP action */
-    snprintf(s_txBuf, sizeof(s_txBuf), "AT+HTTPACTION=%d", (int)method);
+    /* Acquire MQTT client (index 0, TCP mode) */
+    snprintf(s_txBuf, sizeof(s_txBuf), "AT+CMQTTACCQ=0,\"%s\",0", clientId);
+    if (!SendAT(s_txBuf, "OK", 3000)) goto mqtt_fail;
+
+    /* Connect to broker */
+    if (username && username[0] != '\0') {
+        snprintf(s_txBuf, sizeof(s_txBuf),
+            "AT+CMQTTCONNECT=0,\"tcp://%s:%u\",60,1,\"%s\",\"%s\"",
+            brokerIp, port, username, password ? password : "");
+    } else {
+        snprintf(s_txBuf, sizeof(s_txBuf),
+            "AT+CMQTTCONNECT=0,\"tcp://%s:%u\",60,1",
+            brokerIp, port);
+    }
+
     UART_SendLine(s_txBuf);
-    UART_ReadResponse(6000);
+    UART_ReadResponse(10000);  // Connection can take time
 
-    /* Parse HTTP status from +HTTPACTION: <method>,<status>,<datalen> */
-    {
-        char* p = strstr(s_rxBuf, "+HTTPACTION:");
-        if (p) {
-            int m, s, d;
-            if (sscanf(p, "+HTTPACTION: %d,%d,%d", &m, &s, &d) >= 2) {
-                httpStatus = (uint16_t)s;
-            }
-        }
+    /* Check for +CMQTTCONNECT: 0,0 (success) */
+    if (strstr(s_rxBuf, "+CMQTTCONNECT: 0,0") == NULL) {
+        goto mqtt_fail;
     }
 
-    /* Read response body */
-    if (response && respLen > 0 && httpStatus >= 200 && httpStatus < 300) {
-        SendAT("AT+HTTPREAD=0,500", "+HTTPREAD:", 3000);
-
-        /* Extract body after first newline following +HTTPREAD: */
-        char* p = strstr(s_rxBuf, "+HTTPREAD:");
-        if (p) {
-            char* nl = strchr(p, '\n');
-            if (nl) {
-                nl++;  // Skip newline
-                /* Copy until next +HTTPREAD: or end */
-                char* end = strstr(nl, "\r\nOK");
-                uint16_t copyLen;
-                if (end) {
-                    copyLen = (uint16_t)(end - nl);
-                } else {
-                    copyLen = strlen(nl);
-                }
-                if (copyLen >= respLen) copyLen = respLen - 1;
-                memcpy(response, nl, copyLen);
-                response[copyLen] = '\0';
-
-                /* Trim whitespace */
-                while (copyLen > 0 && (response[copyLen-1] == '\r' ||
-                       response[copyLen-1] == '\n' || response[copyLen-1] == ' ')) {
-                    response[--copyLen] = '\0';
-                }
-            }
-        }
-    }
-
+    s_state = GSM_STATE_MQTT_CONNECTED;
     s_errorCount = 0;
     xSemaphoreGive(s_gsmMutex);
-    return httpStatus;
+    return true;
 
-fail:
+mqtt_fail:
     s_errorCount++;
     if (s_errorCount >= 3) {
         s_state = GSM_STATE_ERROR;
         s_lastResetTick = HAL_GetTick();
+    } else {
+        s_state = GSM_STATE_NETWORK_READY;
     }
     xSemaphoreGive(s_gsmMutex);
-    return 0;
+    return false;
+}
+
+bool GSM_MqttPublish(const char* topic, const char* payload, uint8_t qos)
+{
+    if (s_state != GSM_STATE_MQTT_CONNECTED) return false;
+    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
+
+    uint16_t topicLen = strlen(topic);
+    uint16_t payloadLen = strlen(payload);
+    bool ok = false;
+
+    /* Step 1: Set topic */
+    snprintf(s_txBuf, sizeof(s_txBuf), "AT+CMQTTTOPIC=0,%u", topicLen);
+    UART_SendLine(s_txBuf);
+    UART_ReadResponse(2000);
+    if (strstr(s_rxBuf, ">") == NULL) goto pub_done;
+
+    /* Send topic data */
+    UART_SendRaw(topic, topicLen);
+    UART_ReadResponse(2000);
+    if (strstr(s_rxBuf, "OK") == NULL) goto pub_done;
+
+    /* Step 2: Set payload */
+    snprintf(s_txBuf, sizeof(s_txBuf), "AT+CMQTTPAYLOAD=0,%u", payloadLen);
+    UART_SendLine(s_txBuf);
+    UART_ReadResponse(2000);
+    if (strstr(s_rxBuf, ">") == NULL) goto pub_done;
+
+    /* Send payload data */
+    UART_SendRaw(payload, payloadLen);
+    UART_ReadResponse(2000);
+    if (strstr(s_rxBuf, "OK") == NULL) goto pub_done;
+
+    /* Step 3: Publish */
+    snprintf(s_txBuf, sizeof(s_txBuf), "AT+CMQTTPUB=0,%u,60", qos);
+    UART_SendLine(s_txBuf);
+    UART_ReadResponse(5000);
+
+    /* +CMQTTPUB: 0,0 = success */
+    ok = (strstr(s_rxBuf, "+CMQTTPUB: 0,0") != NULL);
+
+pub_done:
+    if (!ok) {
+        s_errorCount++;
+        if (s_errorCount >= 3) {
+            s_state = GSM_STATE_ERROR;
+            s_lastResetTick = HAL_GetTick();
+        }
+    } else {
+        s_errorCount = 0;
+    }
+
+    xSemaphoreGive(s_gsmMutex);
+    return ok;
+}
+
+bool GSM_MqttSubscribe(const char* topic, uint8_t qos)
+{
+    if (s_state != GSM_STATE_MQTT_CONNECTED) return false;
+    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
+
+    uint16_t topicLen = strlen(topic);
+    bool ok = false;
+
+    /* AT+CMQTTSUB=0,<topic_len>,<qos> then send topic data */
+    snprintf(s_txBuf, sizeof(s_txBuf), "AT+CMQTTSUB=0,%u,%u", topicLen, qos);
+    UART_SendLine(s_txBuf);
+    UART_ReadResponse(2000);
+    if (strstr(s_rxBuf, ">") == NULL) goto sub_done;
+
+    /* Send topic string */
+    UART_SendRaw(topic, topicLen);
+    UART_ReadResponse(5000);
+
+    /* +CMQTTSUB: 0,0 = success */
+    ok = (strstr(s_rxBuf, "+CMQTTSUB: 0,0") != NULL);
+
+sub_done:
+    xSemaphoreGive(s_gsmMutex);
+    return ok;
+}
+
+void GSM_MqttProcessIncoming(void)
+{
+    if (s_state != GSM_STATE_MQTT_CONNECTED) return;
+    if (!s_mqttCallback) return;
+    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    /* Non-blocking check for incoming data */
+    uint16_t len = UART_ReadResponse(50);
+
+    if (len > 0 && strstr(s_rxBuf, "+CMQTTRXSTART:") != NULL) {
+        /* Parse: +CMQTTRXSTART: 0,<topic_len>,<payload_len> */
+        uint16_t topicLen = 0, payloadLen = 0;
+        char* p = strstr(s_rxBuf, "+CMQTTRXSTART:");
+        if (p) {
+            int cl, tl, pl;
+            sscanf(p, "+CMQTTRXSTART: %d,%hu,%hu", &cl, &topicLen, &payloadLen);
+        }
+
+        /* Extract topic from +CMQTTRXTOPIC: ... */
+        p = strstr(s_rxBuf, "+CMQTTRXTOPIC:");
+        if (p) {
+            /* Skip past the header line to get the topic data */
+            char* nl = strchr(p, '\n');
+            if (nl) {
+                nl++;
+                uint16_t copyLen = topicLen;
+                if (copyLen >= sizeof(s_incomingTopic)) copyLen = sizeof(s_incomingTopic) - 1;
+                memcpy(s_incomingTopic, nl, copyLen);
+                s_incomingTopic[copyLen] = '\0';
+            }
+        }
+
+        /* Extract payload from +CMQTTRXPAYLOAD: ... */
+        p = strstr(s_rxBuf, "+CMQTTRXPAYLOAD:");
+        if (p) {
+            char* nl = strchr(p, '\n');
+            if (nl) {
+                nl++;
+                uint16_t copyLen = payloadLen;
+                if (copyLen >= sizeof(s_incomingPayload)) copyLen = sizeof(s_incomingPayload) - 1;
+                memcpy(s_incomingPayload, nl, copyLen);
+                s_incomingPayload[copyLen] = '\0';
+            }
+        }
+
+        /* Invoke callback if we got both topic and payload */
+        if (s_incomingTopic[0] != '\0') {
+            xSemaphoreGive(s_gsmMutex);
+            s_mqttCallback(s_incomingTopic, s_incomingPayload, strlen(s_incomingPayload));
+            return;
+        }
+    }
+
+    xSemaphoreGive(s_gsmMutex);
+}
+
+void GSM_MqttDisconnect(void)
+{
+    if (xSemaphoreTake(s_gsmMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return;
+
+    SendAT("AT+CMQTTDISC=0,60", "OK", 3000);
+    SendAT("AT+CMQTTREL=0", "OK", 1000);
+    SendAT("AT+CMQTTSTOP", "OK", 1000);
+
+    s_state = GSM_STATE_NETWORK_READY;
+
+    xSemaphoreGive(s_gsmMutex);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
