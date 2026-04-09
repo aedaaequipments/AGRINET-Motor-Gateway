@@ -8,6 +8,8 @@
 
 #include "flash_config.h"
 #include "credentials.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,9 +118,15 @@ static bool ReadFromFlash(FlashConfig_t* cfg)
 static bool WriteToFlash(const FlashConfig_t* cfg)
 {
     HAL_StatusTypeDef status;
+    bool result = false;
+
+    /* H-NEW-6 fix: STM32F103 flash erase/program stalls the instruction bus.
+     * Any ISR that reads flash during this window will hard fault.
+     * Enter critical section to mask all interrupts during flash operations. */
+    taskENTER_CRITICAL();
 
     status = HAL_FLASH_Unlock();
-    if (status != HAL_OK) return false;
+    if (status != HAL_OK) { taskEXIT_CRITICAL(); return false; }
 
     FLASH_EraseInitTypeDef erase;
     uint32_t pageError = 0;
@@ -129,6 +137,7 @@ static bool WriteToFlash(const FlashConfig_t* cfg)
     status = HAL_FLASHEx_Erase(&erase, &pageError);
     if (status != HAL_OK) {
         HAL_FLASH_Lock();
+        taskEXIT_CRITICAL();
         return false;
     }
 
@@ -136,17 +145,19 @@ static bool WriteToFlash(const FlashConfig_t* cfg)
     uint32_t addr = FLASH_CONFIG_ADDR;
     uint16_t words = (sizeof(FlashConfig_t) + 1) / 2;
 
+    result = true;
     for (uint16_t i = 0; i < words; i++) {
         status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, addr, src[i]);
         if (status != HAL_OK) {
-            HAL_FLASH_Lock();
-            return false;
+            result = false;
+            break;
         }
         addr += 2;
     }
 
     HAL_FLASH_Lock();
-    return true;
+    taskEXIT_CRITICAL();
+    return result;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
