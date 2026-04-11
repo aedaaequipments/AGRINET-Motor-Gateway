@@ -20,7 +20,8 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * SSD1306 COMMANDS
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define SSD1306_ADDR            (OLED_I2C_ADDR << 1)
+static uint8_t s_oled_i2c_addr = OLED_I2C_ADDR;
+#define SSD1306_ADDR            (s_oled_i2c_addr << 1)
 #define SSD1306_CMD             0x00
 #define SSD1306_DATA            0x40
 #define SSD1306_DISPLAY_OFF     0xAE
@@ -140,16 +141,17 @@ static void WriteData(const uint8_t* data, uint16_t len)
 }
 
 /**
- * M1 FIX: SH1106 uses page-mode addressing (not horizontal mode like SSD1306).
- * SH1106 has 132-column RAM with 128 visible, offset by +2 columns.
- * Use page address + column high/low nibble commands.
+ * Set cursor for horizontal addressing mode (SSD1306 standard)
  */
 static void SetCursor(uint8_t page, uint8_t col)
 {
-    col += 2;  /* SH1106 column offset: 132-col RAM, 128 visible, +2 offset */
-    WriteCmd(0xB0 | (page & 0x07));           /* Set page address (0xB0-0xB7) */
-    WriteCmd(0x00 | (col & 0x0F));            /* Set lower column nibble */
-    WriteCmd(0x10 | ((col >> 4) & 0x0F));     /* Set upper column nibble */
+    WriteCmd(SSD1306_SET_PAGE_ADDR);
+    WriteCmd(page);
+    WriteCmd(0);  /* End page */
+    
+    WriteCmd(SSD1306_SET_COL_ADDR);
+    WriteCmd(col);
+    WriteCmd(127);  /* End column */
 }
 
 static void ClearScreen(void)
@@ -329,37 +331,51 @@ bool Display_Init(void)
     gpio.Pin   = PIN_OLED_SDA_PIN | PIN_OLED_SCL_PIN;
     gpio.Mode  = GPIO_MODE_AF_OD;
     gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    gpio.Pull  = GPIO_PULLUP;  /* Explicit pull-ups for I2C */
     HAL_GPIO_Init(GPIOB, &gpio);
 
     s_hi2c1.Instance             = I2C1;
-    s_hi2c1.Init.ClockSpeed      = 400000;
+    s_hi2c1.Init.ClockSpeed      = 100000;  /* Reduced to 100kHz for reliability */
     s_hi2c1.Init.DutyCycle        = I2C_DUTYCYCLE_2;
     s_hi2c1.Init.OwnAddress1     = 0;
     s_hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
-    if (HAL_I2C_Init(&s_hi2c1) != HAL_OK) return false;
-
-    /* Check if OLED is present */
-    if (HAL_I2C_IsDeviceReady(&s_hi2c1, SSD1306_ADDR, 3, 100) != HAL_OK) {
+    if (HAL_I2C_Init(&s_hi2c1) != HAL_OK) {
         return false;
     }
 
-    /* M1 FIX: Init sequence for SH1106 (1.3" OLED) — page-mode only.
-     * SH1106 does NOT support horizontal addressing mode (0x20 cmd).
-     * Uses page addressing with column set via high/low nibble commands. */
+    /* Delay for I2C to stabilize */
+    HAL_Delay(10);
+
+    /* Check if OLED is present at 0x3C */
+    s_oled_i2c_addr = OLED_I2C_ADDR;
+    if (HAL_I2C_IsDeviceReady(&s_hi2c1, SSD1306_ADDR, 3, 100) == HAL_OK) {
+        /* Device found at 0x3C */
+    } else {
+        /* Try 0x3D */
+        s_oled_i2c_addr = 0x3D;
+        if (HAL_I2C_IsDeviceReady(&s_hi2c1, SSD1306_ADDR, 3, 100) != HAL_OK) {
+            return false;
+        }
+    }
+
+    /* Try SSD1306 standard init first (works for most 128x64 OLED modules) */
     WriteCmd(SSD1306_DISPLAY_OFF);
+    HAL_Delay(5);
+    WriteCmd(SSD1306_SET_CLK_DIV);    WriteCmd(0x80);
     WriteCmd(SSD1306_SET_MUX);        WriteCmd(63);         /* 64 rows */
     WriteCmd(SSD1306_SET_OFFSET);     WriteCmd(0);
-    WriteCmd(SSD1306_SET_START_LINE);                        /* Start line 0 */
-    WriteCmd(SSD1306_SEG_REMAP);                             /* Col 127 = SEG0 */
-    WriteCmd(SSD1306_COM_SCAN_DEC);                          /* COM63 to COM0 */
-    WriteCmd(SSD1306_SET_COM_PINS);   WriteCmd(0x12);        /* Alt COM, no remap */
-    WriteCmd(SSD1306_SET_CONTRAST);   WriteCmd(0x80);        /* SH1106 default */
-    WriteCmd(SSD1306_ENTIRE_ON_RES);
-    WriteCmd(SSD1306_NORMAL_DISPLAY);
-    WriteCmd(SSD1306_SET_CLK_DIV);    WriteCmd(0x80);
+    WriteCmd(SSD1306_SET_START_LINE | 0);                   /* Start line 0 */
     WriteCmd(SSD1306_CHARGE_PUMP);    WriteCmd(0x14);        /* Enable charge pump */
-    /* NOTE: SSD1306_SET_ADDR_MODE removed — SH1106 only supports page mode */
+    WriteCmd(SSD1306_SET_ADDR_MODE);  WriteCmd(0x00);        /* Horizontal addressing */
+    WriteCmd(SSD1306_SEG_REMAP | 1);                         /* Remap columns */
+    WriteCmd(SSD1306_COM_SCAN_DEC);                          /* COM scan reversed */
+    WriteCmd(SSD1306_SET_COM_PINS);   WriteCmd(0x12);
+    WriteCmd(SSD1306_SET_CONTRAST);   WriteCmd(0x7F);
+    WriteCmd(SSD1306_ENTIRE_ON_RES);                         /* Output follows RAM content */
+    WriteCmd(SSD1306_NORMAL_DISPLAY);                        /* Normal (not inverted) */
+    HAL_Delay(100);
     WriteCmd(SSD1306_DISPLAY_ON);
+    HAL_Delay(100);
 
     ClearScreen();
     s_initialized = true;

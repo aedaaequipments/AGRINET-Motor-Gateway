@@ -151,8 +151,13 @@ static void DWT_Init(void)
  * SYSTEM CLOCK CONFIG (72MHz from 8MHz HSE)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static bool s_hseOk = false;  /* Track if HSE started (for debug output) */
+
 static void SystemClock_Config(void)
 {
+    HAL_StatusTypeDef status;
+
+    /* Try HSE first (8MHz external crystal → PLL → 72MHz) */
     RCC_OscInitTypeDef osc = {0};
     osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
     osc.HSEState       = RCC_HSE_ON;
@@ -160,18 +165,35 @@ static void SystemClock_Config(void)
     osc.PLL.PLLState   = RCC_PLL_ON;
     osc.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
     osc.PLL.PLLMUL     = RCC_PLL_MUL9;  // 8MHz * 9 = 72MHz
-    HAL_RCC_OscConfig(&osc);
+    status = HAL_RCC_OscConfig(&osc);
+
+    if (status != HAL_OK) {
+        /* HSE failed (common on GD32 clones with bad crystals).
+         * Fall back to HSI (8MHz internal RC) → PLL → 64MHz.
+         * UART/timers will still work, just slightly slower. */
+        memset(&osc, 0, sizeof(osc));
+        osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+        osc.HSIState       = RCC_HSI_ON;
+        osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+        osc.PLL.PLLState   = RCC_PLL_ON;
+        osc.PLL.PLLSource  = RCC_PLLSOURCE_HSI_DIV2;
+        osc.PLL.PLLMUL     = RCC_PLL_MUL16;  // (8MHz/2) * 16 = 64MHz
+        HAL_RCC_OscConfig(&osc);
+        s_hseOk = false;
+    } else {
+        s_hseOk = true;
+    }
 
     RCC_ClkInitTypeDef clk = {0};
     clk.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                           RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
     clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV2;   // APB1 = 36MHz max
-    clk.APB2CLKDivider = RCC_HCLK_DIV1;   // APB2 = 72MHz
+    clk.APB1CLKDivider = RCC_HCLK_DIV2;   // APB1 max 36MHz
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;   // APB2 = SYSCLK
     HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2);
 
-    /* ADC prescaler: 72MHz / 6 = 12MHz (max 14MHz) */
+    /* ADC prescaler: keep under 14MHz */
     __HAL_RCC_ADC_CONFIG(RCC_ADCPCLK2_DIV6);
 }
 
@@ -418,6 +440,11 @@ int main(void)
 
     /* Banner */
     Debug_Print("\r\n=== AGRINET Master Gateway v" FW_VERSION_STR " ===\r\n");
+    if (s_hseOk) {
+        Debug_Print("CLK: HSE 72MHz OK\r\n");
+    } else {
+        Debug_Print("CLK: HSE FAILED - using HSI 64MHz (GD32 clone?)\r\n");
+    }
 
     /* Load config from flash */
     bool configLoaded = FlashConfig_Init();
