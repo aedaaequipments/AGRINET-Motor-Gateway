@@ -24,10 +24,10 @@ static uint32_t g_stateEnterTick = 0;   // Tick when current state entered
 static uint32_t g_lastEnergyTick = 0;   // For kWh accumulation
 static uint32_t g_dryRunStartTick = 0;  // When dry-run condition first detected
 
-/* Flags */
-static bool g_startRequested = false;
-static bool g_stopRequested = false;
-static bool g_calibrationPending = false;
+/* C4 FIX: Flags written from ISR/multiple tasks — must be volatile */
+static volatile bool g_startRequested = false;
+static volatile bool g_stopRequested = false;
+static volatile bool g_calibrationPending = false;
 static bool g_calibrationActive = false;
 static uint32_t g_calibrationStartTick = 0;
 
@@ -407,7 +407,8 @@ void MotorControl_Stop(FaultCode_t fault)
 }
 
 MotorState_t MotorControl_GetState(void)   { return g_state; }
-bool MotorControl_IsRunning(void)          { return g_state == MOTOR_DELTA; }
+/* M9 FIX: Motor is running in both STAR and DELTA states */
+bool MotorControl_IsRunning(void)          { return (g_state == MOTOR_STAR || g_state == MOTOR_DELTA); }
 FaultCode_t MotorControl_GetFault(void)    { return g_lastFault; }
 
 const char* MotorControl_FaultString(FaultCode_t fault)
@@ -451,16 +452,19 @@ void MotorControl_GetStats(MotorStats_t* stats)
 
 void MotorControl_ButtonPress(bool isStart)
 {
-    static uint32_t lastPress = 0;
+    /* M8 FIX: Separate debounce timers for start and stop buttons.
+     * Prevents emergency stop being ignored if start was just pressed. */
+    static uint32_t lastStartPress = 0;
+    static uint32_t lastStopPress = 0;
     uint32_t now = HAL_GetTick();
 
-    /* Debounce */
-    if ((now - lastPress) < BUTTON_DEBOUNCE_MS) return;
-    lastPress = now;
-
     if (isStart) {
+        if ((now - lastStartPress) < BUTTON_DEBOUNCE_MS) return;
+        lastStartPress = now;
         MotorControl_Start();
     } else {
+        if ((now - lastStopPress) < BUTTON_DEBOUNCE_MS) return;
+        lastStopPress = now;
         MotorControl_Stop(FAULT_MANUAL_STOP);
     }
 }

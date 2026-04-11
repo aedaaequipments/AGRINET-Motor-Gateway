@@ -73,9 +73,15 @@ int16_t LoRa_GetRSSI(void);
 int8_t LoRa_GetSNR(void);
 
 /**
- * @brief Check if TX/RX interrupt fired (call from DIO0 EXTI handler)
+ * @brief DIO0 ISR handler — sets flag only, no SPI (ISR-safe)
  */
 void LoRa_HandleDIO0_IRQ(void);
+
+/**
+ * @brief Poll IRQ flag and process SPI registers (call from task context)
+ * Must be called periodically from the LoRa task loop.
+ */
+void LoRa_PollIRQ(void);
 
 #ifdef __cplusplus
 }

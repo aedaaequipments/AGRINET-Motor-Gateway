@@ -263,13 +263,16 @@ bool LoRa_Send(const uint8_t* data, uint8_t length)
     s_txDone = false;
     SetMode(MODE_TX);
 
-    /* Wait for TX complete (max 5s for SF12) */
+    /* Wait for TX complete (max 5s for SF12).
+     * C1 FIX: Call LoRa_PollIRQ() here to process the DIO0 flag since
+     * the ISR only sets a flag and does not read SPI registers. */
     uint32_t start = HAL_GetTick();
     while (!s_txDone) {
         if ((HAL_GetTick() - start) > 5000) {
             SetMode(MODE_STDBY);
             return false;
         }
+        LoRa_PollIRQ();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
@@ -317,8 +320,25 @@ void LoRa_Wake(void)  { SetMode(MODE_STDBY); }
 int16_t LoRa_GetRSSI(void) { return s_lastRSSI; }
 int8_t  LoRa_GetSNR(void)  { return s_lastSNR; }
 
+/**
+ * C1 FIX: LoRa DIO0 ISR must NOT call SPI functions (mutex from ISR = hard fault).
+ * Instead, just set a flag. The actual SPI register read is deferred to
+ * LoRa_PollIRQ() which is called from task context.
+ */
+static volatile bool s_dio0Fired = false;
+
 void LoRa_HandleDIO0_IRQ(void)
 {
+    /* ISR-safe: only set flag, no SPI, no mutex, no FreeRTOS API */
+    s_dio0Fired = true;
+}
+
+void LoRa_PollIRQ(void)
+{
+    if (!s_dio0Fired) return;
+    s_dio0Fired = false;
+
+    /* Now safe to call SPI from task context */
     uint8_t irq = SPI_ReadByte(REG_IRQ_FLAGS);
     if (irq & IRQ_TX_DONE) s_txDone = true;
     if (irq & IRQ_RX_DONE) {

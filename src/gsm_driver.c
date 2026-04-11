@@ -130,8 +130,15 @@ bool GSM_Init(void)
     s_huart3.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
     HAL_UART_Init(&s_huart3);
 
-    /* Initialization sequence */
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Wait for module boot
+    /* M6 FIX: Use HAL_Delay if scheduler not started yet (called from main).
+     * vTaskDelay before scheduler = hard fault. Safe to use HAL_Delay here
+     * because this runs before tasks are created. After scheduler starts,
+     * GSM retries from the CloudSync task use vTaskDelay normally. */
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+        HAL_Delay(2000);
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 
     if (!SendAT("AT", "OK", 2000)) return false;
     if (!SendAT("AT+CPIN?", "READY", 2000)) return false;
@@ -142,7 +149,11 @@ bool GSM_Init(void)
             SendAT("AT+CREG?", "+CREG: 0,5", 2000)) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+            HAL_Delay(2000);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
     }
 
     SendAT("AT+CGATT=1", "OK", 3000);

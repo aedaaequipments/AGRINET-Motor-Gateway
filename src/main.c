@@ -235,6 +235,9 @@ static void Task_LoRaManager(void* pvParam)
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
+        /* C1 FIX: Process LoRa IRQ from task context (ISR only sets flag) */
+        LoRa_PollIRQ();
+
         LoRaManager_Update();
 
         /* Run automation when new weather data arrives */

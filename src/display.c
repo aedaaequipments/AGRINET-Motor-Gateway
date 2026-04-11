@@ -138,14 +138,17 @@ static void WriteData(const uint8_t* data, uint16_t len)
     HAL_I2C_Master_Transmit(&s_hi2c1, SSD1306_ADDR, buf, chunk + 1, 200);
 }
 
+/**
+ * M1 FIX: SH1106 uses page-mode addressing (not horizontal mode like SSD1306).
+ * SH1106 has 132-column RAM with 128 visible, offset by +2 columns.
+ * Use page address + column high/low nibble commands.
+ */
 static void SetCursor(uint8_t page, uint8_t col)
 {
-    WriteCmd(SSD1306_SET_PAGE_ADDR);
-    WriteCmd(page);
-    WriteCmd(page);
-    WriteCmd(SSD1306_SET_COL_ADDR);
-    WriteCmd(col);
-    WriteCmd(127);
+    col += 2;  /* SH1106 column offset: 132-col RAM, 128 visible, +2 offset */
+    WriteCmd(0xB0 | (page & 0x07));           /* Set page address (0xB0-0xB7) */
+    WriteCmd(0x00 | (col & 0x0F));            /* Set lower column nibble */
+    WriteCmd(0x10 | ((col >> 4) & 0x0F));     /* Set upper column nibble */
 }
 
 static void ClearScreen(void)
@@ -339,20 +342,22 @@ bool Display_Init(void)
         return false;
     }
 
-    /* Init sequence */
+    /* M1 FIX: Init sequence for SH1106 (1.3" OLED) — page-mode only.
+     * SH1106 does NOT support horizontal addressing mode (0x20 cmd).
+     * Uses page addressing with column set via high/low nibble commands. */
     WriteCmd(SSD1306_DISPLAY_OFF);
-    WriteCmd(SSD1306_SET_MUX);        WriteCmd(63);
+    WriteCmd(SSD1306_SET_MUX);        WriteCmd(63);         /* 64 rows */
     WriteCmd(SSD1306_SET_OFFSET);     WriteCmd(0);
-    WriteCmd(SSD1306_SET_START_LINE);
-    WriteCmd(SSD1306_SEG_REMAP);
-    WriteCmd(SSD1306_COM_SCAN_DEC);
-    WriteCmd(SSD1306_SET_COM_PINS);   WriteCmd(0x12);
-    WriteCmd(SSD1306_SET_CONTRAST);   WriteCmd(0x7F);
+    WriteCmd(SSD1306_SET_START_LINE);                        /* Start line 0 */
+    WriteCmd(SSD1306_SEG_REMAP);                             /* Col 127 = SEG0 */
+    WriteCmd(SSD1306_COM_SCAN_DEC);                          /* COM63 to COM0 */
+    WriteCmd(SSD1306_SET_COM_PINS);   WriteCmd(0x12);        /* Alt COM, no remap */
+    WriteCmd(SSD1306_SET_CONTRAST);   WriteCmd(0x80);        /* SH1106 default */
     WriteCmd(SSD1306_ENTIRE_ON_RES);
     WriteCmd(SSD1306_NORMAL_DISPLAY);
     WriteCmd(SSD1306_SET_CLK_DIV);    WriteCmd(0x80);
-    WriteCmd(SSD1306_CHARGE_PUMP);    WriteCmd(0x14);
-    WriteCmd(SSD1306_SET_ADDR_MODE);  WriteCmd(0x00);  // Horizontal
+    WriteCmd(SSD1306_CHARGE_PUMP);    WriteCmd(0x14);        /* Enable charge pump */
+    /* NOTE: SSD1306_SET_ADDR_MODE removed — SH1106 only supports page mode */
     WriteCmd(SSD1306_DISPLAY_ON);
 
     ClearScreen();
