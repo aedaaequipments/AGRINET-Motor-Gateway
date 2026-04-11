@@ -11,6 +11,7 @@
 #include "motor_control.h"
 #include "flash_config.h"
 #include "gsm_driver.h"
+#include "lora_manager.h"
 #include "node_registry.h"
 #include "automation.h"
 #include <string.h>

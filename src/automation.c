@@ -109,9 +109,14 @@ static void EvalIrrigation(const WeatherPayload_t* w)
         if (soilM2 > s_config.L2.max) stopWater = true;
     }
 
-    /* Secondary confirmation from L1 if enabled */
+    /* Secondary confirmation from L1 (surface) if enabled */
     if (s_config.L1.enabled && !needWater) {
         if (soilM1 < s_config.L1.min) needWater = true;
+    }
+
+    /* L3 deep zone: if deep soil is saturated, stop over-irrigating */
+    if (s_config.L3.enabled && soilM3 > s_config.L3.max) {
+        stopWater = true;
     }
 
     /* Environmental adjustment */

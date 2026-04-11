@@ -85,7 +85,7 @@ static uint32_t TimeInState(void)
 
 static void PerformCalibration(void)
 {
-    FlashConfig_t* cfg = FlashConfig_Get();
+    (void)FlashConfig_Get();  /* Ensure config loaded before calibration writes */
     PowerSnapshot_t snap;
     PowerMonitor_GetSnapshot(&snap);
 
