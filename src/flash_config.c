@@ -8,6 +8,7 @@
 
 #include "flash_config.h"
 #include "credentials.h"
+#include "watchdog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -119,6 +120,11 @@ static bool WriteToFlash(const FlashConfig_t* cfg)
 {
     HAL_StatusTypeDef status;
     bool result = false;
+
+    /* C5 FIX: Feed watchdog BEFORE entering critical section.
+     * Flash erase+write takes ~40ms with interrupts masked, so WDT must
+     * be freshly fed to avoid reset during the operation. */
+    Watchdog_Feed();
 
     /* H-NEW-6 fix: STM32F103 flash erase/program stalls the instruction bus.
      * Any ISR that reads flash during this window will hard fault.

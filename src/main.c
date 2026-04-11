@@ -462,7 +462,7 @@ int main(void)
 
     if (Display_Init()) {
         Display_Splash();
-        Debug_Print("OLED: SSD1306 OK\r\n");
+        Debug_Print("OLED: SH1106 1.3\" OK\r\n");
     } else {
         Debug_Print("OLED: NOT FOUND\r\n");
     }

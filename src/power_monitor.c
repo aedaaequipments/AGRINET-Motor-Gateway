@@ -8,7 +8,9 @@
  */
 
 #include "power_monitor.h"
+#include "watchdog.h"
 #include "FreeRTOS.h"
+#include "task.h"
 #include "semphr.h"
 #include <math.h>
 #include <string.h>
@@ -174,6 +176,13 @@ void PowerMonitor_Sample(void)
         /* 72MHz * 400us = 28800 cycles */
         while ((DWT->CYCCNT - startTick) < 28800) {
             __NOP();
+        }
+
+        /* C3 FIX: Feed watchdog mid-sampling and yield to same-priority tasks
+         * every 50 samples (~20ms) to prevent starving the motor control task */
+        if ((s % 50) == 49) {
+            Watchdog_Feed();
+            taskYIELD();
         }
     }
 

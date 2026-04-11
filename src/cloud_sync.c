@@ -12,6 +12,7 @@
 #include "flash_config.h"
 #include "motor_control.h"
 #include "power_monitor.h"
+#include "offline_queue.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,8 +114,12 @@ static void OnMqttMessage(const char* topic, const char* payload, uint16_t paylo
 static void BuildTopic(const char* type, const char* deviceId, const char* suffix)
 {
     FlashConfig_t* cfg = FlashConfig_Get();
+
+    /* M2 FIX: Use "unassigned" if farmId is empty (prevents invalid MQTT topics) */
+    const char* farm = (cfg->farmId[0] != '\0') ? cfg->farmId : "unassigned";
+
     snprintf(s_topicBuf, sizeof(s_topicBuf), "%s/%s/%s/%s",
-             type, cfg->farmId, deviceId, suffix);
+             type, farm, deviceId, suffix);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -168,7 +173,7 @@ static uint16_t BuildWeatherJson(const WeatherPayload_t* w)
         (float)w->airTemp / 100.0f,
         (float)w->soilTemp / 100.0f,
         (float)w->humidity / 100.0f,
-        (float)w->soilM2 / 100.0f,
+        (float)w->soilM1 / 100.0f,   /* M3 FIX: was soilM2 (copy-paste bug) */
         (float)w->soilM2 / 100.0f,
         (float)w->soilM3 / 100.0f,
         (float)w->lightLux * 10.0f / 655.35f,
@@ -342,13 +347,20 @@ void CloudSync_Update(void)
     GSM_Update();
 
     /* Ensure MQTT connected (auto-reconnect on failure) */
-    if (!EnsureMqttConnected()) return;
+    bool online = EnsureMqttConnected();
 
-    /* Ensure subscribed to command topic */
-    EnsureSubscribed();
+    if (online) {
+        /* Ensure subscribed to command topic */
+        EnsureSubscribed();
 
-    /* Process incoming MQTT messages (command subscription) */
-    GSM_MqttProcessIncoming();
+        /* Process incoming MQTT messages (command subscription) */
+        GSM_MqttProcessIncoming();
+
+        /* M5 FIX: Drain offline queue when back online */
+        if (!OfflineQueue_IsEmpty()) {
+            OfflineQueue_Flush();
+        }
+    }
 
     /* Push motor telemetry every CLOUD_PUSH_PERIOD_MS */
     if ((now - s_lastPushTick) >= CLOUD_PUSH_PERIOD_MS) {
@@ -359,23 +371,37 @@ void CloudSync_Update(void)
         bool running = MotorControl_IsRunning();
         HealthStatus_t health = PowerMonitor_AssessHealth();
 
-        CloudSync_PushMotorData(&snap, running, health);
+        if (online) {
+            CloudSync_PushMotorData(&snap, running, health);
+        } else {
+            /* M5 FIX: Queue telemetry for later delivery when offline */
+            FlashConfig_t* cfg = FlashConfig_Get();
+            BuildMotorJson(&snap, running, health);
+            snprintf(s_topicBuf, sizeof(s_topicBuf), "data/%s/%s/telemetry",
+                     cfg->farmId, cfg->deviceId);
+            OfflineQueue_Enqueue(s_topicBuf, s_jsonBuf, 1);
+        }
 
         /* Push fault alert if motor is in fault state */
         FaultCode_t fault = MotorControl_GetFault();
         if (fault != FAULT_NONE && fault != FAULT_MANUAL_STOP &&
             fault != FAULT_REMOTE_STOP) {
-            CloudSync_PushAlert(
-                MotorControl_FaultString(fault),
-                "device", "critical",
-                "Check motor and power supply"
-            );
+            if (online) {
+                CloudSync_PushAlert(
+                    MotorControl_FaultString(fault),
+                    "device", "critical",
+                    "Check motor and power supply"
+                );
+            }
+            /* Alerts not queued offline — stale alerts are not useful */
         }
     }
 
     /* Heartbeat every HEARTBEAT_PERIOD_MS */
     if ((now - s_lastHeartbeatTick) >= HEARTBEAT_PERIOD_MS) {
         s_lastHeartbeatTick = now;
-        CloudSync_Heartbeat();
+        if (online) {
+            CloudSync_Heartbeat();
+        }
     }
 }
