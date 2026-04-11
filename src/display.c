@@ -327,6 +327,27 @@ bool Display_Init(void)
     __HAL_RCC_I2C1_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
+    /* STM32F1 I2C BUSY flag errata workaround (AN2824):
+     * After power-on or watchdog reset, BUSY can be stuck HIGH.
+     * GD32 clones do NOT have this bug, but this workaround is safe for both.
+     * Toggle SCL 9 times as GPIO to clear any stuck slave. */
+    {
+        GPIO_InitTypeDef scl_gpio = {0};
+        scl_gpio.Pin   = PIN_OLED_SCL_PIN;
+        scl_gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+        scl_gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+        scl_gpio.Pull  = GPIO_PULLUP;
+        HAL_GPIO_Init(GPIOB, &scl_gpio);
+
+        /* Toggle SCL 9 times */
+        for (int i = 0; i < 9; i++) {
+            HAL_GPIO_WritePin(GPIOB, PIN_OLED_SCL_PIN, GPIO_PIN_RESET);
+            for (volatile int d = 0; d < 100; d++) { __NOP(); }
+            HAL_GPIO_WritePin(GPIOB, PIN_OLED_SCL_PIN, GPIO_PIN_SET);
+            for (volatile int d = 0; d < 100; d++) { __NOP(); }
+        }
+    }
+
     GPIO_InitTypeDef gpio = {0};
     gpio.Pin   = PIN_OLED_SDA_PIN | PIN_OLED_SCL_PIN;
     gpio.Mode  = GPIO_MODE_AF_OD;
@@ -335,7 +356,7 @@ bool Display_Init(void)
     HAL_GPIO_Init(GPIOB, &gpio);
 
     s_hi2c1.Instance             = I2C1;
-    s_hi2c1.Init.ClockSpeed      = 100000;  /* Reduced to 100kHz for reliability */
+    s_hi2c1.Init.ClockSpeed      = 100000;  /* 100kHz for reliability on clones */
     s_hi2c1.Init.DutyCycle        = I2C_DUTYCYCLE_2;
     s_hi2c1.Init.OwnAddress1     = 0;
     s_hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;

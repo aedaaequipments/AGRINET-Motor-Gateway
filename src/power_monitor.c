@@ -15,6 +15,9 @@
 #include <math.h>
 #include <string.h>
 
+/* DWT availability flag set by main.c DWT_Init() */
+extern bool g_dwtAvailable;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * PRIVATE DATA
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -71,8 +74,9 @@ void PowerMonitor_Init(void)
     hadc1.Init.NbrOfConversion       = 1;
     HAL_ADC_Init(&hadc1);
 
-    /* Calibrate ADC */
+    /* Calibrate ADC (GD32 needs short settling after calibration) */
     HAL_ADCEx_Calibration_Start(&hadc1);
+    for (volatile uint32_t d = 0; d < 200; d++) { __NOP(); }  /* ~10us settle */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -164,18 +168,25 @@ void PowerMonitor_Sample(void)
     const uint32_t channels_i[3] = { PIN_I_CT_R_CH, PIN_I_CT_Y_CH, PIN_I_CT_B_CH };
 
     for (uint16_t s = 0; s < ADC_SAMPLES_PER_CYCLE; s++) {
-        uint32_t startTick = DWT->CYCCNT;  // Use cycle counter for precise timing
-
         /* Sample all 6 channels as quickly as possible */
         for (uint8_t ph = 0; ph < 3; ph++) {
             g_vSamples[ph][s] = ReadADC(channels_v[ph]);
             g_iSamples[ph][s] = ReadADC(channels_i[ph]);
         }
 
-        /* Wait for next sample point (~400us interval for 50Hz x 3 cycles) */
-        /* 72MHz * 400us = 28800 cycles */
-        while ((DWT->CYCCNT - startTick) < 28800) {
-            __NOP();
+        /* Wait for next sample point (~400us interval for 50Hz x 3 cycles).
+         * GD32/CKS32 clones may have DWT CYCCNT locked (reads 0 always).
+         * Fall back to calibrated NOP loop if DWT unavailable. */
+        if (g_dwtAvailable) {
+            /* Precise: 72MHz * 400us = 28800 cycles (or 64MHz * 400us = 25600) */
+            uint32_t startTick = DWT->CYCCNT;
+            uint32_t target = (SystemCoreClock / 2500);  /* SYSCLK / 2500 = 400us worth of cycles */
+            while ((DWT->CYCCNT - startTick) < target) {
+                __NOP();
+            }
+        } else {
+            /* Fallback: ~400us NOP delay (calibrated for 64-72MHz) */
+            for (volatile uint32_t d = 0; d < 2400; d++) { __NOP(); }
         }
 
         /* C3 FIX: Feed watchdog mid-sampling and yield to same-priority tasks

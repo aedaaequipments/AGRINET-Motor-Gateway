@@ -147,6 +147,10 @@ static bool WriteToFlash(const FlashConfig_t* cfg)
         return false;
     }
 
+    /* GD32 clone fix: needs ~1ms settling after page erase before programming.
+     * Use NOP loop since interrupts are masked (can't use HAL_Delay). */
+    for (volatile uint32_t i = 0; i < 8000; i++) { __NOP(); }
+
     const uint16_t* src = (const uint16_t*)cfg;
     uint32_t addr = FLASH_CONFIG_ADDR;
     uint16_t words = (sizeof(FlashConfig_t) + 1) / 2;

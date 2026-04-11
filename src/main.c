@@ -138,13 +138,24 @@ static inline void LED_Toggle(void) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * DWT CYCLE COUNTER (for precise ADC timing)
+ * GD32/CKS32 clones may have TRCENA locked when no debug probe attached.
+ * If CYCCNT doesn't increment, power_monitor falls back to a NOP loop.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+bool g_dwtAvailable = false;  /* Shared — power_monitor.c reads this */
 
 static void DWT_Init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    /* Verify CYCCNT actually increments (fails on some GD32 clones) */
+    volatile uint32_t before = DWT->CYCCNT;
+    __NOP(); __NOP(); __NOP(); __NOP();
+    volatile uint32_t after = DWT->CYCCNT;
+
+    g_dwtAvailable = (after != before);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -445,6 +456,7 @@ int main(void)
     } else {
         Debug_Print("CLK: HSE FAILED - using HSI 64MHz (GD32 clone?)\r\n");
     }
+    Debug_Print(g_dwtAvailable ? "DWT: CYCCNT OK\r\n" : "DWT: CYCCNT LOCKED (NOP fallback)\r\n");
 
     /* Load config from flash */
     bool configLoaded = FlashConfig_Init();
