@@ -95,10 +95,13 @@
 #define configKERNEL_INTERRUPT_PRIORITY         (configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
 
-/* Map FreeRTOS port interrupt handlers to STM32 HAL names */
+/* Map FreeRTOS port interrupt handlers to STM32 HAL names.
+ * NOTE: SysTick_Handler is NOT mapped here — it's defined manually in main.c
+ * so HAL_IncTick() runs before the scheduler starts (prevents HardFault
+ * from xTaskIncrementTick accessing uninitialized data). */
 #define vPortSVCHandler     SVC_Handler
 #define xPortPendSVHandler  PendSV_Handler
-#define xPortSysTickHandler SysTick_Handler
+/* #define xPortSysTickHandler SysTick_Handler  -- see main.c */
 
 /* Optional: include for assert */
 #define configASSERT(x) if (!(x)) { taskDISABLE_INTERRUPTS(); for(;;); }

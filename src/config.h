@@ -93,14 +93,15 @@
 #define PIN_GSM_RX_PORT     GPIOB
 #define PIN_GSM_RX_PIN      GPIO_PIN_11     // PB11 - USART3 RX
 
-/* --- OLED SSD1306 (I2C1) --- */
+/* --- OLED SH1106 1.3" (I2C1) --- */
+/* STM32F103 I2C1: PB6=SCL, PB7=SDA (hardware alternate function) */
 #define PIN_OLED_SDA_PORT   GPIOB
-#define PIN_OLED_SDA_PIN    GPIO_PIN_6      // PB6 - I2C1 SDA
+#define PIN_OLED_SDA_PIN    GPIO_PIN_7      // PB7 - I2C1 SDA
 
 #define PIN_OLED_SCL_PORT   GPIOB
-#define PIN_OLED_SCL_PIN    GPIO_PIN_7      // PB7 - I2C1 SCL
+#define PIN_OLED_SCL_PIN    GPIO_PIN_6      // PB6 - I2C1 SCL
 
-#define OLED_I2C_ADDR       0x3C            // SSD1306 7-bit address
+#define OLED_I2C_ADDR       0x3C            // SH1106 7-bit address
 
 /* --- Debug UART (USART1) --- */
 #define PIN_DEBUG_TX_PORT   GPIOA
@@ -138,10 +139,22 @@
 #define DEFAULT_STAR_DELTA_SEC  10          // Star-to-delta transition (seconds)
 #define DEAD_TIME_MS            50          // Dead time between star-off and delta-on (ms)
 
-/* --- Auto-calibration multipliers --- */
-#define OVERLOAD_MULTIPLIER     1.3f        // Trip at 130% of rated current
+/* --- Auto-calibration: 10-20% threshold bands (flagship feature) --- */
+#define OVERLOAD_MULTIPLIER     1.20f       // Trip at 120% of rated current
 #define DRY_RUN_MULTIPLIER      0.3f        // No-load < 30% of rated current
-#define SAFE_MODE_MULTIPLIER    1.1f        // Safe mode: trip at 110%
+#define SAFE_MODE_MULTIPLIER    1.10f       // Safe mode: trip at 110%
+#define THRESH_UPPER_BAND       0.20f       // Upper threshold band = +20% of rated
+#define THRESH_LOWER_BAND       0.10f       // Lower threshold band = -10% of rated
+
+/* --- Advanced fault detection --- */
+#define LOAD_RISE_THRESHOLD     0.50f       // 50% current rise in < 2s = sand jam / sudden load
+#define LOAD_DROP_THRESHOLD     0.40f       // 40% current drop in < 2s = belt break / coupling fail
+#define LOAD_CHANGE_WINDOW_MS   2000        // Time window for di/dt detection
+#define SUPPLY_SAG_THRESHOLD    0.85f       // Voltage < 85% of rated = supply sag
+#define SUPPLY_SWELL_THRESHOLD  1.15f       // Voltage > 115% of rated = supply swell
+#define SUPPLY_FAULT_HOLD_MS    3000        // Must sustain for 3s to trip
+#define GROUND_LEAK_THRESHOLD   0.10f       // Phase current sum residual > 10% of avg = leak
+#define STALL_CURRENT_MULT      2.5f        // Current > 250% rated with no change = stall/jam
 
 /* --- Star-delta auto-timing by HP --- */
 #define SD_DELAY_PER_HP         1.5f        // Extra seconds per HP
@@ -251,6 +264,11 @@ typedef enum {
     FAULT_CURRENT_IMBALANCE,
     FAULT_MANUAL_STOP,
     FAULT_REMOTE_STOP,
+    FAULT_SAND_JAM,             /* Stall: high current + no speed change */
+    FAULT_SUDDEN_LOAD_RISE,     /* di/dt spike > 50% in < 2s */
+    FAULT_SUDDEN_LOAD_DROP,     /* di/dt drop > 40% in < 2s */
+    FAULT_SUPPLY_FAULT,         /* Voltage sag/swell > 15% sustained */
+    FAULT_GROUND_LEAK,          /* Phase current sum imbalance (residual) */
 } FaultCode_t;
 
 /**

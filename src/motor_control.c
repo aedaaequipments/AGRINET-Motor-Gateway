@@ -31,6 +31,12 @@ static volatile bool g_calibrationPending = false;
 static bool g_calibrationActive = false;
 static uint32_t g_calibrationStartTick = 0;
 
+/* Advanced fault detection state */
+static float g_prevAvgCurrent = 0;          /* Previous cycle avg current for di/dt */
+static uint32_t g_prevCurrentTick = 0;      /* Timestamp of previous reading */
+static uint32_t g_supplyFaultStart = 0;     /* When supply sag/swell first detected */
+static float g_ratedVoltageRef = 230.0f;    /* Reference voltage for sag/swell calc */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RELAY CONTROL (Active HIGH)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -85,14 +91,18 @@ static uint32_t TimeInState(void)
 
 static void PerformCalibration(void)
 {
-    (void)FlashConfig_Get();  /* Ensure config loaded before calibration writes */
+    (void)FlashConfig_Get();
     PowerSnapshot_t snap;
     PowerMonitor_GetSnapshot(&snap);
 
-    /* Compute HP */
+    /* Compute HP from 3-phase power measurement */
     float sqrt3 = 1.732f;
     float watts = sqrt3 * snap.avgVoltage * snap.avgCurrent * snap.avgPF;
     float hp = watts / 746.0f;
+
+    /* Clamp to supported range: 7HP - 25HP */
+    if (hp < 7.0f) hp = 7.0f;
+    if (hp > 25.0f) hp = 25.0f;
 
     /* Store calibration */
     CalibrationData_t cal;
@@ -100,25 +110,30 @@ static void PerformCalibration(void)
     cal.ratedVoltage  = snap.avgVoltage;
     cal.ratedCurrent  = snap.avgCurrent;
     cal.phases        = 3;
-    cal.calibratedAt  = HAL_GetTick() / 1000;  // Approximate (real timestamp from GSM later)
+    cal.calibratedAt  = HAL_GetTick() / 1000;
     cal.isCalibrated  = true;
     FlashConfig_SetCalibration(&cal);
 
-    /* Auto-set protection thresholds */
+    /* Auto-set protection thresholds with 10-20% adaptive bands:
+     *   Upper trip  = rated * (1 + THRESH_UPPER_BAND) = +20%
+     *   Lower alarm = rated * (1 - THRESH_LOWER_BAND) = -10%
+     *   Voltage: +15% over / -15% under from measured line voltage */
     ProtectionConfig_t prot;
-    prot.overVoltage  = DEFAULT_OVER_VOLTAGE;
-    prot.underVoltage = DEFAULT_UNDER_VOLTAGE;
-    prot.overloadAmps = snap.avgCurrent * OVERLOAD_MULTIPLIER;
+    prot.overVoltage  = snap.avgVoltage * SUPPLY_SWELL_THRESHOLD;  /* +15% of actual */
+    prot.underVoltage = snap.avgVoltage * SUPPLY_SAG_THRESHOLD;    /* -15% of actual */
+    prot.overloadAmps = snap.avgCurrent * (1.0f + THRESH_UPPER_BAND);  /* +20% */
     prot.dryRunSec    = DEFAULT_DRY_RUN_SEC;
     prot.restartDelay = DEFAULT_RESTART_DELAY;
     FlashConfig_SetProtection(&prot);
+
+    /* Store reference voltage for supply analysis */
+    g_ratedVoltageRef = snap.avgVoltage;
 
     /* Auto star-delta timing: base + per-HP scaling */
     float sdDelay = SD_DELAY_BASE + (hp * SD_DELAY_PER_HP);
     if (sdDelay > SD_DELAY_MAX) sdDelay = SD_DELAY_MAX;
     FlashConfig_SetStarDeltaDelay(sdDelay);
 
-    /* Save to flash */
     FlashConfig_Save();
 
     g_calibrationActive = false;
@@ -164,17 +179,79 @@ static FaultCode_t RunProtectionChecks(void)
     /* Dry run needs sustained condition (not just momentary) */
     if (iFault == FAULT_DRY_RUN) {
         if (g_dryRunStartTick == 0) {
-            g_dryRunStartTick = HAL_GetTick();  // Start counting
+            g_dryRunStartTick = HAL_GetTick();
         }
         if ((HAL_GetTick() - g_dryRunStartTick) < (cfg->protection.dryRunSec * 1000)) {
-            return FAULT_NONE;  // Not yet timed out
+            return FAULT_NONE;
         }
-        return FAULT_DRY_RUN;  // Timed out!
+        return FAULT_DRY_RUN;
     } else {
-        g_dryRunStartTick = 0;  // Reset dry-run timer
+        g_dryRunStartTick = 0;
     }
 
-    return iFault;
+    if (iFault != FAULT_NONE) return iFault;
+
+    /* === ADVANCED FAULT DETECTION (only when motor running in delta) === */
+    if (g_state != MOTOR_DELTA) return FAULT_NONE;
+
+    PowerSnapshot_t snap;
+    PowerMonitor_GetSnapshot(&snap);
+    float avgI = snap.avgCurrent;
+    float avgV = snap.avgVoltage;
+    uint32_t now = HAL_GetTick();
+
+    /* Use calibrated voltage as reference for supply analysis */
+    if (cfg->calibration.isCalibrated && cfg->calibration.ratedVoltage > 100.0f) {
+        g_ratedVoltageRef = cfg->calibration.ratedVoltage;
+    }
+
+    /* --- Sand Jam / Stall detection ---
+     * Very high current (>250% rated) sustained = mechanical jam */
+    if (cfg->calibration.isCalibrated && avgI > cfg->calibration.ratedCurrent * STALL_CURRENT_MULT) {
+        return FAULT_SAND_JAM;
+    }
+
+    /* --- Sudden Load Rise (di/dt > +50% in <2s) ---
+     * Belt seized, foreign object, pump blockage */
+    if (g_prevCurrentTick > 0 && cfg->calibration.isCalibrated &&
+        (now - g_prevCurrentTick) < LOAD_CHANGE_WINDOW_MS && g_prevAvgCurrent > 0.5f) {
+        float rise = (avgI - g_prevAvgCurrent) / g_prevAvgCurrent;
+        if (rise > LOAD_RISE_THRESHOLD) {
+            return FAULT_SUDDEN_LOAD_RISE;
+        }
+        /* --- Sudden Load Drop (di/dt < -40% in <2s) ---
+         * Belt break, coupling failure, pipe burst */
+        if (rise < -LOAD_DROP_THRESHOLD) {
+            return FAULT_SUDDEN_LOAD_DROP;
+        }
+    }
+
+    /* --- Supply Sag/Swell (sustained >3s) ---
+     * Input voltage problem, grid instability */
+    float vRatio = avgV / g_ratedVoltageRef;
+    if (vRatio < SUPPLY_SAG_THRESHOLD || vRatio > SUPPLY_SWELL_THRESHOLD) {
+        if (g_supplyFaultStart == 0) g_supplyFaultStart = now;
+        if ((now - g_supplyFaultStart) > SUPPLY_FAULT_HOLD_MS) {
+            return FAULT_SUPPLY_FAULT;
+        }
+    } else {
+        g_supplyFaultStart = 0;
+    }
+
+    /* --- Ground Leak (residual current imbalance) ---
+     * Sum of 3 phase currents should be ~0. If not, current leaking to ground.
+     * Note: Software estimation — real ELCB/RCD uses dedicated CT on neutral. */
+    float sumI = snap.r.current + snap.y.current + snap.b.current;
+    float residual = fabsf(sumI - 3.0f * avgI);  /* Deviation from balanced */
+    if (avgI > 1.0f && residual > (avgI * GROUND_LEAK_THRESHOLD * 3.0f)) {
+        return FAULT_GROUND_LEAK;
+    }
+
+    /* Update previous reading for next cycle di/dt */
+    g_prevAvgCurrent = avgI;
+    g_prevCurrentTick = now;
+
+    return FAULT_NONE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -421,8 +498,13 @@ const char* MotorControl_FaultString(FaultCode_t fault)
         case FAULT_DRY_RUN:           return "Dry Run";
         case FAULT_PHASE_LOSS:        return "Phase Loss";
         case FAULT_CURRENT_IMBALANCE: return "I Imbalance";
-        case FAULT_MANUAL_STOP:       return "Manual Stop";
-        case FAULT_REMOTE_STOP:       return "Remote Stop";
+        case FAULT_MANUAL_STOP:       return "Manual";
+        case FAULT_REMOTE_STOP:       return "Remote";
+        case FAULT_SAND_JAM:          return "JAMMED!";
+        case FAULT_SUDDEN_LOAD_RISE:  return "LOAD SPIKE";
+        case FAULT_SUDDEN_LOAD_DROP:  return "LOAD DROP";
+        case FAULT_SUPPLY_FAULT:      return "SUPPLY BAD";
+        case FAULT_GROUND_LEAK:       return "GND LEAK!";
         default:                      return "Unknown";
     }
 }

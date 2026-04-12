@@ -24,9 +24,10 @@ extern "C" {
 typedef enum {
     PAGE_POWER = 0,
     PAGE_MOTOR,
+    PAGE_NETWORK,
     PAGE_WEATHER,
     PAGE_VALVES,
-    PAGE_NETWORK,
+    PAGE_ALERTS,
     PAGE_COUNT
 } DisplayPage_t;
 

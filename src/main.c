@@ -33,6 +33,27 @@
 #include <string.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * SYSTICK HANDLER (safe for pre-scheduler + FreeRTOS)
+ *
+ * FreeRTOSConfig.h no longer maps xPortSysTickHandler→SysTick_Handler.
+ * We define SysTick_Handler here so HAL_IncTick() runs from power-on
+ * (needed for HAL_Delay), and xPortSysTickHandler only runs after the
+ * scheduler starts. Without this, xTaskIncrementTick touches uninitialized
+ * FreeRTOS structures → HardFault on clone chips (CKS32/GD32/APM32).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static volatile bool s_schedulerRunning = false;
+
+extern void xPortSysTickHandler(void);
+
+void SysTick_Handler(void)
+{
+    HAL_IncTick();
+    if (s_schedulerRunning) {
+        xPortSysTickHandler();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * STATIC TASK BUFFERS (no dynamic allocation)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -265,6 +286,14 @@ static void Task_MotorControl(void* pvParam)
 static void Task_LoRaManager(void* pvParam)
 {
     (void)pvParam;
+
+    /* Init LoRa from task context (uses HAL_Delay, can't block main) */
+    if (LoRaManager_Init()) {
+        Debug_Print("LoRa: SX1276 OK (IN865)\r\n");
+    } else {
+        Debug_Print("LoRa: INIT FAILED\r\n");
+    }
+
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
@@ -308,6 +337,15 @@ static void Task_LoRaManager(void* pvParam)
 static void Task_CloudSync(void* pvParam)
 {
     (void)pvParam;
+
+    /* Init GSM from task context (uses HAL_Delay, can't block main) */
+    if (GSM_Init()) {
+        Debug_Print("GSM: SIM7670C OK\r\n");
+    } else {
+        Debug_Print("GSM: INIT FAILED (will retry)\r\n");
+    }
+    CloudSync_Init();
+
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
@@ -447,10 +485,20 @@ int main(void)
 
     /* Peripheral init */
     LED_Init();
-    Debug_Init();
 
-    /* Banner */
-    Debug_Print("\r\n=== AGRINET Master Gateway v" FW_VERSION_STR " ===\r\n");
+    /* UART + OLED early init */
+    Debug_Init();
+    Debug_Print("\r\n=== SASYAMITHRA Motor Gateway v" FW_VERSION_STR " ===\r\n");
+
+    bool oledOk = Display_Init();
+    if (oledOk) {
+        Display_Splash();
+        Debug_Print("OLED: 1.3\" 128x64 OK\r\n");
+    } else {
+        Debug_Print("OLED: NOT FOUND\r\n");
+    }
+
+    /* Banner continued */
     if (s_hseOk) {
         Debug_Print("CLK: HSE 72MHz OK\r\n");
     } else {
@@ -476,37 +524,21 @@ int main(void)
         Debug_Print("WARNING: Watchdog reset detected!\r\n");
     }
 
-    /* Init subsystems */
+    /* Init fast subsystems only — LoRa/GSM init moved into their tasks
+     * to avoid blocking the scheduler (they use HAL_Delay which can
+     * hang for seconds if hardware is absent). */
     PowerMonitor_Init();
     MotorControl_Init();
-
-    /* Phase 2: LoRa + GSM */
-    if (LoRaManager_Init()) {
-        Debug_Print("LoRa: SX1276 OK (IN865)\r\n");
-    } else {
-        Debug_Print("LoRa: INIT FAILED\r\n");
-    }
-
-    if (GSM_Init()) {
-        Debug_Print("GSM: SIM7670C OK\r\n");
-        CloudSync_Init();
-    } else {
-        Debug_Print("GSM: INIT FAILED (will retry)\r\n");
-        CloudSync_Init();
-    }
-
-    /* Phase 3: Automation + Display + Offline Queue */
     Automation_Init();
     OfflineQueue_Init();
 
-    if (Display_Init()) {
-        Display_Splash();
-        Debug_Print("OLED: SH1106 1.3\" OK\r\n");
+    if (oledOk) {
+        Debug_Print("OLED: 1.3\" 128x64 OK\r\n");
     } else {
         Debug_Print("OLED: NOT FOUND\r\n");
     }
 
-    Debug_Print("All subsystems initialized.\r\n");
+    Debug_Print("Starting scheduler...\r\n");
 
     /* Create FreeRTOS tasks (static allocation) */
     xTaskCreateStatic(Task_PowerMonitor, "Power",
@@ -535,6 +567,7 @@ int main(void)
     Watchdog_Init();
 
     /* Start FreeRTOS scheduler -- never returns */
+    s_schedulerRunning = true;
     vTaskStartScheduler();
 
     /* Should never reach here */
