@@ -289,8 +289,8 @@ static void RenderPowerPage(void)
     PowerMonitor_GetSnapshot(&snap);
 
     /* Row 0-1: Voltages BIG */
-    snprintf(s_line, 22, "%.0f %.0f %.0fV",
-        snap.r.voltage, snap.y.voltage, snap.b.voltage);
+    snprintf(s_line, 22, "%d %d %dV",
+        (int)snap.r.voltage, (int)snap.y.voltage, (int)snap.b.voltage);
     RenderBig(0, s_line);
 
     /* Row 2-3: Currents BIG */
@@ -303,7 +303,7 @@ static void RenderPowerPage(void)
     RenderBig(4, s_line);
 
     /* Row 6-7: PF and Imbalance BIG */
-    snprintf(s_line, 22, "PF%.2f I%.0f%%", snap.avgPF, snap.currentImbalance);
+    snprintf(s_line, 22, "PF%.2f I%d%%", snap.avgPF, (int)snap.currentImbalance);
     RenderBig(6, s_line);
 }
 

@@ -289,7 +289,6 @@ static void Task_LoRaManager(void* pvParam)
 
     /* Init LoRa from task context (uses HAL_Delay, can't block main) */
     bool loraOk = LoRaManager_Init();
-    Debug_Print(loraOk ? "LoRa: SX1276 OK\r\n" : "LoRa: INIT FAIL\r\n");
 
     TickType_t xLastWake = xTaskGetTickCount();
 
@@ -383,7 +382,7 @@ static void Task_Display(void* pvParam)
 
             /* Line 1: Calibrated readings */
             snprintf(line, sizeof(line),
-                "[%s] %s V:%d,%d,%d I:%.1f,%.1f,%.1f PF:%.2f %.2fkW\r\n",
+                "[%s] %s V:%d,%d,%d A:%.1f,%.1f,%.1f PF:%.2f %.2fkW\r\n",
                 cfg->deviceId,
                 MotorControl_IsRunning() ? "RUN" : "STOP",
                 (int)snap.r.voltage, (int)snap.y.voltage, (int)snap.b.voltage,

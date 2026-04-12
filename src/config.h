@@ -186,9 +186,9 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define TASK_POWER_STACK        256         // words (1024 bytes)
 #define TASK_MOTOR_STACK        384         // words (1536 bytes)
-#define TASK_LORA_STACK         512         // words (2048 bytes) — SPI+init needs more
+#define TASK_LORA_STACK         384         // words (1536 bytes)
 #define TASK_CLOUD_STACK        512         // words (2048 bytes)
-#define TASK_DISPLAY_STACK      320         // words (1280 bytes) — C6 FIX: snprintf+I2C needs more
+#define TASK_DISPLAY_STACK      320         // words (1280 bytes)
 
 #define TASK_POWER_PRIO         3           // Highest: safety-critical
 #define TASK_MOTOR_PRIO         3           // Same as power (co-operative)
