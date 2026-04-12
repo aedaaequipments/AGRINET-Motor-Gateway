@@ -91,6 +91,30 @@ HealthStatus_t PowerMonitor_AssessHealth(void);
  */
 float PowerMonitor_AccumulateEnergy(uint32_t deltaMs);
 
+/**
+ * @brief Load V/I calibration factors from flash config
+ */
+void PowerMonitor_LoadCalibration(void);
+
+/**
+ * @brief Set voltage CT ratio (saved to flash config, takes effect immediately)
+ * @param vCtRatio e.g. 230.0 for ZMPT101B with default burden
+ */
+void PowerMonitor_SetVCal(float vCtRatio);
+
+/**
+ * @brief Set current CT ratio (saved to flash config, takes effect immediately)
+ * @param iCtRatio e.g. 30.0 for SCT-013-030
+ */
+void PowerMonitor_SetICal(float iCtRatio);
+
+/**
+ * @brief Get raw ADC readings for debug/calibration
+ * @param rawV[3] Raw 12-bit ADC values for voltage phases R,Y,B
+ * @param rawI[3] Raw 12-bit ADC values for current phases R,Y,B
+ */
+void PowerMonitor_GetRawADC(uint16_t rawV[3], uint16_t rawI[3]);
+
 #ifdef __cplusplus
 }
 #endif

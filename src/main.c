@@ -103,7 +103,7 @@ static void Debug_Init(void)
     HAL_GPIO_Init(PIN_DEBUG_RX_PORT, &gpio);
 
     huart1.Instance          = USART1;
-    huart1.Init.BaudRate     = 115200;
+    huart1.Init.BaudRate     = 9600;
     huart1.Init.WordLength   = UART_WORDLENGTH_8B;
     huart1.Init.StopBits     = UART_STOPBITS_1;
     huart1.Init.Parity       = UART_PARITY_NONE;
@@ -288,15 +288,17 @@ static void Task_LoRaManager(void* pvParam)
     (void)pvParam;
 
     /* Init LoRa from task context (uses HAL_Delay, can't block main) */
-    if (LoRaManager_Init()) {
-        Debug_Print("LoRa: SX1276 OK (IN865)\r\n");
-    } else {
-        Debug_Print("LoRa: INIT FAILED\r\n");
-    }
+    bool loraOk = LoRaManager_Init();
+    Debug_Print(loraOk ? "LoRa: SX1276 OK\r\n" : "LoRa: INIT FAIL\r\n");
 
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
+        if (!loraOk) {
+            Watchdog_Feed();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         /* C1 FIX: Process LoRa IRQ from task context (ISR only sets flag) */
         LoRa_PollIRQ();
 
@@ -364,38 +366,53 @@ static void Task_Display(void* pvParam)
     (void)pvParam;
     TickType_t xLastWake = xTaskGetTickCount();
 
-    char line[64];
+    char line[128];
+    uint8_t serialDiv = 0;
 
     for (;;) {
-        /* OLED display (5-page auto-cycling) */
+        /* OLED display (6-page auto-cycling) */
         Display_Update();
 
-        /* Also output summary to debug UART */
-        PowerSnapshot_t snap;
-        PowerMonitor_GetSnapshot(&snap);
-        FlashConfig_t* cfg = FlashConfig_Get();
+        /* Serial telemetry every 3 seconds (3 x DISPLAY_UPDATE_MS) */
+        if (++serialDiv >= 3) {
+            serialDiv = 0;
 
-        snprintf(line, sizeof(line),
-            "[%s] %s R:%.0fV Y:%.0fV B:%.0fV PF:%.2f %.1fkW\r\n",
-            cfg->deviceId,
-            MotorControl_IsRunning() ? "RUN" : "STOP",
-            snap.r.voltage, snap.y.voltage, snap.b.voltage,
-            snap.avgPF, snap.totalPower
-        );
-        Debug_Print(line);
+            PowerSnapshot_t snap;
+            PowerMonitor_GetSnapshot(&snap);
+            FlashConfig_t* cfg = FlashConfig_Get();
 
-        FaultCode_t fault = MotorControl_GetFault();
-        if (fault != FAULT_NONE && fault != FAULT_MANUAL_STOP) {
-            snprintf(line, sizeof(line), "  FAULT: %s\r\n",
-                     MotorControl_FaultString(fault));
+            /* Line 1: Calibrated readings */
+            snprintf(line, sizeof(line),
+                "[%s] %s V:%d,%d,%d I:%.1f,%.1f,%.1f PF:%.2f %.2fkW\r\n",
+                cfg->deviceId,
+                MotorControl_IsRunning() ? "RUN" : "STOP",
+                (int)snap.r.voltage, (int)snap.y.voltage, (int)snap.b.voltage,
+                snap.r.current, snap.y.current, snap.b.current,
+                snap.avgPF, snap.totalPower
+            );
             Debug_Print(line);
-        }
 
-        /* Show offline queue status */
-        uint8_t qLen = OfflineQueue_Count();
-        if (qLen > 0) {
-            snprintf(line, sizeof(line), "  QUEUE: %u pkts pending\r\n", qLen);
+            /* Line 2: Raw ADC values for calibration */
+            uint16_t rv[3], ri[3];
+            PowerMonitor_GetRawADC(rv, ri);
+            snprintf(line, sizeof(line),
+                " RAW V:%u,%u,%u I:%u,%u,%u\r\n",
+                rv[0], rv[1], rv[2], ri[0], ri[1], ri[2]);
             Debug_Print(line);
+
+            FaultCode_t fault = MotorControl_GetFault();
+            if (fault != FAULT_NONE && fault != FAULT_MANUAL_STOP) {
+                snprintf(line, sizeof(line), "  FAULT: %s\r\n",
+                         MotorControl_FaultString(fault));
+                Debug_Print(line);
+            }
+
+            /* Show offline queue status */
+            uint8_t qLen = OfflineQueue_Count();
+            if (qLen > 0) {
+                snprintf(line, sizeof(line), "  QUEUE: %u pkts pending\r\n", qLen);
+                Debug_Print(line);
+            }
         }
 
         LED_Toggle();

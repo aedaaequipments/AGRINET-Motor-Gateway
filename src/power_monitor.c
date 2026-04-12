@@ -8,6 +8,7 @@
  */
 
 #include "power_monitor.h"
+#include "flash_config.h"
 #include "watchdog.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -31,7 +32,11 @@ static StaticSemaphore_t g_snapshotMutexBuf;
 static uint16_t g_vSamples[3][ADC_SAMPLES_PER_CYCLE];  // V phases R,Y,B
 static uint16_t g_iSamples[3][ADC_SAMPLES_PER_CYCLE];  // I phases R,Y,B
 
-/* Calibration factors */
+/* Raw ADC latest readings for debug */
+static uint16_t g_rawV[3];
+static uint16_t g_rawI[3];
+
+/* Calibration factors — updated from flash config or defaults */
 static float g_vCal = V_CT_RATIO / (ADC_RESOLUTION / 2.0f);
 static float g_iCal = I_CT_RATIO / (ADC_RESOLUTION / 2.0f);
 
@@ -77,6 +82,9 @@ void PowerMonitor_Init(void)
     /* Calibrate ADC (GD32 needs short settling after calibration) */
     HAL_ADCEx_Calibration_Start(&hadc1);
     for (volatile uint32_t d = 0; d < 200; d++) { __NOP(); }  /* ~10us settle */
+
+    /* Load CT calibration factors from flash (0 = use compile-time defaults) */
+    PowerMonitor_LoadCalibration();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -195,6 +203,13 @@ void PowerMonitor_Sample(void)
             Watchdog_Feed();
             taskYIELD();
         }
+    }
+
+    /* Store last raw ADC midpoint sample for debug */
+    uint16_t mid = ADC_SAMPLES_PER_CYCLE / 2;
+    for (uint8_t ph = 0; ph < 3; ph++) {
+        g_rawV[ph] = g_vSamples[ph][mid];
+        g_rawI[ph] = g_iSamples[ph][mid];
     }
 
     /* Calculate per-phase readings */
@@ -340,4 +355,45 @@ float PowerMonitor_AccumulateEnergy(uint32_t deltaMs)
     float kw = g_snapshot.totalPower;
     float hours = (float)deltaMs / 3600000.0f;
     return kw * hours;  // kWh
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CALIBRATION — production setup via serial commands
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+void PowerMonitor_LoadCalibration(void)
+{
+    FlashConfig_t* cfg = FlashConfig_Get();
+    float vFactor = cfg->calibration.vCalFactor;
+    float iFactor = cfg->calibration.iCalFactor;
+
+    /* Use flash value if set (>0), otherwise keep compile-time default */
+    if (vFactor > 0.001f) {
+        g_vCal = vFactor / (ADC_RESOLUTION / 2.0f);
+    }
+    if (iFactor > 0.001f) {
+        g_iCal = iFactor / (ADC_RESOLUTION / 2.0f);
+    }
+}
+
+void PowerMonitor_SetVCal(float vCtRatio)
+{
+    FlashConfig_t* cfg = FlashConfig_Get();
+    cfg->calibration.vCalFactor = vCtRatio;
+    g_vCal = vCtRatio / (ADC_RESOLUTION / 2.0f);
+}
+
+void PowerMonitor_SetICal(float iCtRatio)
+{
+    FlashConfig_t* cfg = FlashConfig_Get();
+    cfg->calibration.iCalFactor = iCtRatio;
+    g_iCal = iCtRatio / (ADC_RESOLUTION / 2.0f);
+}
+
+void PowerMonitor_GetRawADC(uint16_t rawV[3], uint16_t rawI[3])
+{
+    for (uint8_t i = 0; i < 3; i++) {
+        rawV[i] = g_rawV[i];
+        rawI[i] = g_rawI[i];
+    }
 }

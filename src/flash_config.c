@@ -7,6 +7,7 @@
  */
 
 #include "flash_config.h"
+#include "power_monitor.h"
 #include "credentials.h"
 #include "watchdog.h"
 #include "FreeRTOS.h"
@@ -379,6 +380,31 @@ void FlashConfig_ProcessCommand(const char* cmd, char* response, uint16_t respLe
     else if (strncmp(cmd, "FACTORY_RESET", 13) == 0) {
         FlashConfig_FactoryReset();
         snprintf(response, respLen, "OK Factory reset done\r\n");
+    }
+    else if (strncmp(cmd, "SET_V_CAL ", 10) == 0) {
+        float val = (float)atof(cmd + 10);
+        if (val > 1.0f && val < 1000.0f) {
+            PowerMonitor_SetVCal(val);
+            snprintf(response, respLen, "OK V_CAL=%.1f\r\n", val);
+        } else {
+            snprintf(response, respLen, "ERR V_CAL range 1-1000\r\n");
+        }
+    }
+    else if (strncmp(cmd, "SET_I_CAL ", 10) == 0) {
+        float val = (float)atof(cmd + 10);
+        if (val > 0.1f && val < 200.0f) {
+            PowerMonitor_SetICal(val);
+            snprintf(response, respLen, "OK I_CAL=%.1f\r\n", val);
+        } else {
+            snprintf(response, respLen, "ERR I_CAL range 0.1-200\r\n");
+        }
+    }
+    else if (strncmp(cmd, "GET_ADC", 7) == 0) {
+        uint16_t rv[3], ri[3];
+        PowerMonitor_GetRawADC(rv, ri);
+        snprintf(response, respLen,
+            "V:%u,%u,%u I:%u,%u,%u\r\n",
+            rv[0], rv[1], rv[2], ri[0], ri[1], ri[2]);
     }
     else if (strncmp(cmd, "SAVE", 4) == 0) {
         if (FlashConfig_Save()) {

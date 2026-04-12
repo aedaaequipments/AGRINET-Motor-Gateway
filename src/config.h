@@ -186,7 +186,7 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define TASK_POWER_STACK        256         // words (1024 bytes)
 #define TASK_MOTOR_STACK        384         // words (1536 bytes)
-#define TASK_LORA_STACK         384         // words (1536 bytes)
+#define TASK_LORA_STACK         512         // words (2048 bytes) — SPI+init needs more
 #define TASK_CLOUD_STACK        512         // words (2048 bytes)
 #define TASK_DISPLAY_STACK      320         // words (1280 bytes) — C6 FIX: snprintf+I2C needs more
 
@@ -298,6 +298,8 @@ typedef struct {
     float ratedHP;          // Detected motor HP
     float ratedVoltage;     // Measured line voltage
     float ratedCurrent;     // Measured delta current
+    float vCalFactor;       // Voltage CT cal factor (0=use default V_CT_RATIO)
+    float iCalFactor;       // Current CT cal factor (0=use default I_CT_RATIO)
     uint8_t phases;         // Always 3
     uint32_t calibratedAt;  // Unix timestamp
     bool isCalibrated;      // Has been calibrated
